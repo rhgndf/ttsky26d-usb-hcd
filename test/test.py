@@ -566,6 +566,17 @@ async def test_buffer_lengths(dut):
     for n in (0, 1, 8, 63, 64):
         await host_out(n)
 
+    # ---------- back-to-back host DATA writes then readback, both parities ----------
+    # alternating 0xAA/0x55 exercises every byte position and both half-words
+    await spi_write(dut, 9, [0])        # LEN write resets buffer pointer
+    pattern = [0xAA if i % 2 == 0 else 0x55 for i in range(64)]
+    for b in pattern:
+        await spi_write(dut, 0x0A, [b])
+    await spi_write(dut, 9, [0])        # reset pointer for readback
+    for i, b in enumerate(pattern):
+        got = (await spi_read(dut, 0x0A, 1))[0]
+        assert got == b, f"byte {i}: wrote {b:#x} read {got:#x}"
+
     # ---------- host IN: model sends, DUT buffers ----------
     async def host_in(n):
         data = payload(n, seed=0x40 + n)

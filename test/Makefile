@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v usb_regs.v spi_slave.v i2c_slave.v usb_sie.v
+PROJECT_SOURCES = project.v usb_regs.v spi_slave.v i2c_slave.v usb_sie.v rf_top.v
 
 ifneq ($(GATES),yes)
 
@@ -20,6 +20,7 @@ else
 SIM_BUILD				= sim_build/gl
 COMPILE_ARGS    += -DGL_TEST
 COMPILE_ARGS    += -DFUNCTIONAL
+# gate_level_netlist.v = runs/*/final/pnl powered netlist (has power pins)
 COMPILE_ARGS    += -DUSE_POWER_PINS
 COMPILE_ARGS    += -DSIM
 COMPILE_ARGS    += -DUNIT_DELAY=\#1
@@ -28,6 +29,9 @@ VERILOG_SOURCES += $(PDK_ROOT)/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_f
 
 # this gets copied in by the GDS action workflow
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
+
+# behavioral model for the rf_top register-file macro
+VERILOG_SOURCES += $(SRC_DIR)/rf_top.v
 
 endif
 

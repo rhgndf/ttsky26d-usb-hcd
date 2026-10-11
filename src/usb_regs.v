@@ -67,8 +67,16 @@ module usb_regs (
     reg [3:0] irq_en;
     reg [7:0] result;
     reg [7:0] token;
-    reg [7:0] buffer_mem [0:63];
     reg [5:0] bufptr;
+
+    // 64-byte packet buffer: tnt's rf_top register file, 32 words x 32 bits,
+    // only the low 16 bits of each word used (one byte per half word).
+    // Synchronous read: both read ports are addressed with the next-state
+    // word address so the outputs always hold the word at bufptr.
+    reg  [15:0] fw_data;
+    reg  [4:0]  fw_addr;
+    reg         fw_valid;
+    wire [31:0] ra_data, rb_data;
 
     // select active port for writes / side effects
     wire        sel_a = a_active;
@@ -81,8 +89,32 @@ module usb_regs (
     wire data_rd = rd_en && (waddr == ADDR_DATA);
     wire len_wr  = wr_en && (waddr == ADDR_LEN);
     wire buf_inc = data_wr || data_rd || sie_buf_inc || sie_buf_we;
+    wire buf_clr = sie_bufptr_clr || len_wr || sie_len_wr;
+    wire [5:0] bufptr_next = buf_clr ? 6'd0 : buf_inc ? bufptr + 6'd1 : bufptr;
 
-    assign buf_rdata = buffer_mem[bufptr];
+    // read-modify-write: merge the new byte into the word at bufptr
+    wire        buf_we   = data_wr || sie_buf_we;
+    wire [7:0]  buf_byte = data_wr ? wdata : sie_buf_wdata;
+    wire [15:0] cur_word = (fw_valid && fw_addr == bufptr[5:1])
+                           ? fw_data : rb_data[15:0];
+    wire [15:0] new_word = bufptr[0] ? {buf_byte, cur_word[7:0]}
+                                     : {cur_word[15:8], buf_byte};
+
+    rf_top i_rf (
+        .w_data  ({16'b0, new_word}),
+        .w_addr  (bufptr[5:1]),
+        .w_ena   (buf_we),
+        .ra_addr (bufptr_next[5:1]),
+        .rb_addr (bufptr_next[5:1]),
+        .ra_data (ra_data),
+        .rb_data (rb_data),
+        .clk     (clk)
+    );
+
+    wire [15:0] buf_word = (fw_valid && fw_addr == bufptr[5:1])
+                           ? fw_data : ra_data[15:0];
+    wire [7:0] buf_byte_rd = bufptr[0] ? buf_word[15:8] : buf_word[7:0];
+    assign buf_rdata = buf_byte_rd;
 
     // single read port muxed by interface: SPI when CS_N low, else I2C
     reg [7:0] rdata_r;
@@ -99,7 +131,7 @@ module usb_regs (
             ADDR_RESULT: rdata_r = result;
             ADDR_TOKEN:  rdata_r = token;
             ADDR_LEN:    rdata_r = {1'b0, len_reg};
-            ADDR_DATA:   rdata_r = buffer_mem[bufptr];
+            ADDR_DATA:   rdata_r = buf_byte_rd;
             ADDR_FL:     rdata_r = frame[7:0];
             ADDR_FH:     rdata_r = {5'b0, frame[10:8]};
             default:     rdata_r = 8'h00;
@@ -123,21 +155,20 @@ module usb_regs (
             result    <= 0;
             token     <= 0;
             bufptr    <= 0;
+            fw_valid  <= 0;
             cmd_wr    <= 0;
         end else begin
             cmd_wr <= 0;
 
             // buffer pointer
-            if (sie_bufptr_clr || len_wr || sie_len_wr)
-                bufptr <= 0;
-            else if (buf_inc)
-                bufptr <= bufptr + 1;
+            bufptr <= bufptr_next;
 
-            // buffer write port
-            if (data_wr)
-                buffer_mem[bufptr] <= wdata;
-            else if (sie_buf_we)
-                buffer_mem[bufptr] <= sie_buf_wdata;
+            // write forwarding for read-during-write (macro uncharacterized)
+            fw_valid <= buf_we;
+            if (buf_we) begin
+                fw_addr <= bufptr[5:1];
+                fw_data <= new_word;
+            end
 
             if (wr_en) begin
                 case (waddr)
