@@ -142,10 +142,8 @@ module usb_regs (
             cmd_wr <= 0;
 
             // buffer pointer
-            if (sie_buf_we && sie_bufptr_clr)
-                bufptr <= 1;
-            else if (sie_bufptr_clr || len_wr)
-                bufptr <= 0;
+            if (sie_bufptr_clr || len_wr)
+                bufptr <= buf_inc ? 1 : 0;
             else if (buf_inc)
                 bufptr <= bufptr + 1;
 

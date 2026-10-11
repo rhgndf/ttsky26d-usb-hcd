@@ -114,59 +114,26 @@ module usb_sie (
 
     integer i;
     integer j;
-    reg [15:0] crc16_tmp;
-    reg [4:0] crc5_tmp;
     reg [10:0] token_tmp;
     reg [7:0] tx_raw_bit;
     reg tx_bit;
+    reg tx_emit;
     reg tx_dp_i, tx_dm_i;
-
-    function [15:0] crc16_bytes;
-        input [3:0] n;
-        integer x, y;
-        reg [15:0] c;
-        reg mix;
-        begin
-            c = 16'hffff;
-            for (x=0; x<8; x=x+1) begin
-                if (x<n) begin
-                    for (y=0; y<8; y=y+1) begin
-                        mix = c[0] ^ tx_payload[x][y];
-                        c = c >> 1;
-                        if (mix) c = c ^ 16'ha001;
-                    end
-                end
-            end
-            crc16_bytes = ~c;
-        end
-    endfunction
-
-    function [4:0] crc5_token;
-        input [10:0] token_data;
-        integer x;
-        reg [4:0] c;
-        reg mix;
-        begin
-            c = 5'h1f;
-            for (x=0; x<11; x=x+1) begin
-                mix = c[0] ^ token_data[x];
-                c = c >> 1;
-                if (mix) c = c ^ 5'h14;
-            end
-            crc5_token = ~c;
-        end
-    endfunction
+    reg [15:0] crc;
+    reg [6:0] tx_crc_end;
+    reg [1:0] tx_crc_mode;   // 0 none, 1 crc16, 2 crc5
 
     task start_token;
         input [7:0] pid_byte;
         input [10:0] token_data;
-        reg [4:0] c5;
         begin
-            c5 = crc5_token(token_data);
             tx_mem[0] = 8'h80;
             tx_mem[1] = pid_byte;
             tx_mem[2] = {token_data[7:0]};
-            tx_mem[3] = {c5, token_data[10:8]};
+            tx_mem[3] = {5'b0, token_data[10:8]};
+            crc <= 16'hffff;
+            tx_crc_mode <= 2;
+            tx_crc_end <= 27;
             tx_done <= 0;
             tx_nbits <= 32;
             tx_bit_index <= 0;
@@ -183,16 +150,15 @@ module usb_sie (
     task start_data_packet;
         input [7:0] pid_byte;
         input [3:0] n;
-        reg [15:0] c16;
         integer x;
         begin
             tx_mem[0] = 8'h80;
             tx_mem[1] = pid_byte;
             for (x=0; x<8; x=x+1)
                 if (x<n) tx_mem[x+2] = tx_payload[x];
-            c16 = crc16_bytes(n);
-            tx_mem[n+2] = c16[7:0];
-            tx_mem[n+3] = c16[15:8];
+            crc <= 16'hffff;
+            tx_crc_mode <= 1;
+            tx_crc_end <= 16 + {n,3'b000};
             tx_done <= 0;
             tx_nbits <= (n+4) * 8;
             tx_bit_index <= 0;
@@ -211,6 +177,7 @@ module usb_sie (
         begin
             tx_mem[0] = 8'h80;
             tx_mem[1] = pid_byte;
+            tx_crc_mode <= 0;
             tx_done <= 0;
             tx_nbits <= 16;
             tx_bit_index <= 0;
@@ -229,41 +196,6 @@ module usb_sie (
         begin pid_full = {~p,p}; end
     endfunction
 
-    function [15:0] crc16_rx;
-        input [3:0] n;
-        integer x,y;
-        reg [15:0] c;
-        reg mix;
-        begin
-            c=16'hffff;
-            for (x=0;x<12;x=x+1) begin
-                if (x<n) begin
-                    for (y=0;y<8;y=y+1) begin
-                        mix=c[0]^rx_mem[x+2][y];
-                        c=c>>1;
-                        if (mix)c=c^16'ha001;
-                    end
-                end
-            end
-            crc16_rx=~c;
-        end
-    endfunction
-
-    function [4:0] crc5_rx;
-        input [10:0] t;
-        integer x;
-        reg [4:0] c;
-        reg mix;
-        begin
-            c=5'h1f;
-            for (x=0;x<11;x=x+1) begin
-                mix=c[0]^t[x];
-                c=c>>1;
-                if(mix)c=c^5'h14;
-            end
-            crc5_rx=~c;
-        end
-    endfunction
 
     assign tx_active = (tx_state != TX_IDLE);
     assign tx_oe = tx_active | ctrl[3] | ctrl[4];
@@ -305,6 +237,9 @@ module usb_sie (
             tx_line_dm <= 0;
             tx_done <= 0;
             tx_nbits <= 0;
+            crc <= 0;
+            tx_crc_end <= 0;
+            tx_crc_mode <= 0;
             tx_payload_len <= 0;
             host_op <= 0;
             host_ep <= 0;
@@ -452,6 +387,7 @@ module usb_sie (
                         // Start-of-packet begins with J -> K, first SYNC zero.
                         if (rx_last_dp && !rx_last_dm && !dp_s[1] && dm_s[1]) begin
                             rx_active <= 1;
+                            crc <= 16'hffff;
                             rx_byte_count <= 0;
                             rx_bit_count <= 1;
                             rx_shift <= 0;
@@ -465,11 +401,18 @@ module usb_sie (
                         // decoded bit is 1 when NRZI line state did not change
                         if (dp_s[1] == rx_last_dp && dm_s[1] == rx_last_dm) begin
                             if (rx_ones == 6) begin
-                                rx_ones <= 0; // stuffed zero dropped
+                                rx_bad_stuff <= 1; // a 1 after six 1s is a stuff error
+                                rx_ones <= 0;
                             end else begin
                                 rx_shift[rx_bit_count] <= 1'b1;
                                 rx_bit_count <= rx_bit_count + 1;
                                 rx_ones <= rx_ones + 1;
+                                if (rx_byte_count >= 2) begin
+                                    if (rx_mem[1][1:0] == 2'b01)
+                                        crc[4:0] <= {1'b0, crc[4:1]} ^ (crc[0] ? 5'h0 : 5'h14);
+                                    else
+                                        crc <= {1'b0, crc[15:1]} ^ (crc[0] ? 16'h0 : 16'ha001);
+                                end
                                 if (rx_bit_count == 7) begin
                                     if (rx_byte_count < 16)
                                         rx_mem[rx_byte_count[3:0]] <= {1'b1,rx_shift[6:0]};
@@ -479,12 +422,17 @@ module usb_sie (
                             end
                         end else begin
                             if (rx_ones == 6) begin
-                                rx_bad_stuff <= 1;
-                                rx_ones <= 0;
+                                rx_ones <= 0; // stuffed zero dropped
                             end else begin
                                 rx_shift[rx_bit_count] <= 1'b0;
                                 rx_bit_count <= rx_bit_count + 1;
                                 rx_ones <= 0;
+                                if (rx_byte_count >= 2) begin
+                                    if (rx_mem[1][1:0] == 2'b01)
+                                        crc[4:0] <= {1'b0, crc[4:1]} ^ (crc[0] ? 5'h14 : 5'h0);
+                                    else
+                                        crc <= {1'b0, crc[15:1]} ^ (crc[0] ? 16'ha001 : 16'h0);
+                                end
                                 if (rx_bit_count == 7) begin
                                     if (rx_byte_count < 16)
                                         rx_mem[rx_byte_count[3:0]] <= {1'b0,rx_shift[6:0]};
@@ -510,8 +458,7 @@ module usb_sie (
                         if ((rx_mem[1][3:0] == 4'h1 || rx_mem[1][3:0] == 4'h5 ||
                              rx_mem[1][3:0] == 4'h9 || rx_mem[1][3:0] == 4'hd) && rx_byte_count == 4) begin
                             token_tmp = {rx_mem[3][2:0], rx_mem[2]};
-                            crc5_tmp = crc5_rx(token_tmp);
-                            if (crc5_tmp == rx_mem[3][7:3]) begin
+                            if (crc[4:0] == 5'h6) begin
                                 if (rx_mem[1][3:0] == 4'h5) begin
                                     frame <= token_tmp;
                                     irq_set[1] <= 1;
@@ -553,8 +500,7 @@ module usb_sie (
                             end
                         end else if ((rx_mem[1][3:0] == 4'h3 || rx_mem[1][3:0] == 4'hb) && dev_state == D_WAITDATA) begin
                             // Device DATA0/DATA1. Only commit if this operation accepts it.
-                            crc16_tmp = crc16_rx(rx_byte_count - 4);
-                            if (rx_byte_count >= 4 && {rx_mem[rx_byte_count-1],rx_mem[rx_byte_count-2]} == crc16_tmp) begin
+                            if (rx_byte_count >= 4 && crc == 16'hb001) begin
                                 rx_payload_len <= rx_byte_count - 4;
                                 for (i=0;i<8;i=i+1)
                                     if (i < rx_byte_count-4)
@@ -582,7 +528,14 @@ module usb_sie (
                         end
                     end else begin
                         // Host receives handshake or data while command waits.
-                        if (host_state == H_WAIT && rx_mem[1][3:0] == 4'ha) begin
+                        if (host_state == H_WAIT && rx_mem[1][3:0] == 4'h2) begin
+                            busy <= 0;
+                            host_state <= H_IDLE;
+                            op_done <= 1;
+                            res_wr <= 1;
+                            res_val <= {1'b0,4'b0,4'h2};
+                            irq_set[0] <= 1;
+                        end else if (host_state == H_WAIT && rx_mem[1][3:0] == 4'ha) begin
                             busy <= 0;
                             host_state <= H_IDLE;
                             op_done <= 1;
@@ -598,8 +551,7 @@ module usb_sie (
                             irq_set[0] <= 1;
                         end else if (host_state == H_WAIT && rx_mem[1][3:0] == 4'h3 ||
                                      host_state == H_WAIT && rx_mem[1][3:0] == 4'hb) begin
-                            crc16_tmp = crc16_rx(rx_byte_count - 4);
-                            if (rx_byte_count >= 4 && {rx_mem[rx_byte_count-1],rx_mem[rx_byte_count-2]} == crc16_tmp) begin
+                            if (rx_byte_count >= 4 && crc == 16'hb001) begin
                                 if (rx_byte_count - 4 > 8) begin
                                     busy <= 0;
                                     host_state <= H_IDLE;
@@ -774,9 +726,19 @@ module usb_sie (
                             tx_line_dm <= 0;
                         end else begin
                             tx_raw_bit = tx_mem[tx_bit_index[6:3]];
-                            tx_bit <= tx_raw_bit[tx_bit_index[2:0]];
+                            if (tx_bit_index >= tx_crc_end && tx_crc_mode != 0) begin
+                                tx_emit = ~crc[0];
+                                crc <= {1'b0, crc[15:1]};
+                            end else begin
+                                tx_emit = tx_raw_bit[tx_bit_index[2:0]];
+                                if (tx_bit_index >= 16 && tx_crc_mode == 1)
+                                    crc <= {1'b0, crc[15:1]} ^ ((crc[0] ^ tx_emit) ? 16'ha001 : 16'h0);
+                                else if (tx_bit_index >= 16 && tx_crc_mode == 2)
+                                    crc[4:0] <= {1'b0, crc[4:1]} ^ ((crc[0] ^ tx_emit) ? 5'h14 : 5'h0);
+                            end
+                            tx_bit <= tx_emit;
                             tx_bit_index <= tx_bit_index + 1;
-                            if (tx_raw_bit[tx_bit_index[2:0]]) begin
+                            if (tx_emit) begin
                                 tx_ones <= tx_ones + 1;
                                 if (tx_ones == 5) tx_stuff <= 1;
                             end else begin

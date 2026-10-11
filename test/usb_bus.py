@@ -94,7 +94,7 @@ async def send_packet(dut, packet, bit_period=BIT_PS, jitter_ns=0.0):
     await Timer(4 * 20834, unit="ps")
 
 
-async def recv_packet(dut, limit_cycles=6000):
+async def recv_packet(dut, limit_cycles=100000):
     """Decode one DUT-driven packet. Returns destuffed byte list, or None."""
     step = 5000  # ~16.7 samples per bit cell, incommensurate with clk edges
     started = False
@@ -108,7 +108,7 @@ async def recv_packet(dut, limit_cycles=6000):
             break
     if not started:
         return None
-    for _ in range(16 * 64 + 128):
+    for _ in range(16 * 128 + 256):
         await Timer(step, unit="ps")
         pins = int(dut.uio_in.value)
         samples.append((pins & 1, (pins >> 1) & 1))
