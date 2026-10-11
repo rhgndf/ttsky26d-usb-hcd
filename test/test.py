@@ -342,7 +342,7 @@ async def test_host_setup_handshakes(dut):
 
 @cocotb.test()
 async def test_host_in_error_paths(dut):
-    """Host IN: bad CRC -> BAD, >8 bytes -> OVERFLOW, zero length OK."""
+    """Host IN: bad CRC -> BAD, >64 bytes -> OVERFLOW, zero length OK."""
     await _tb_init(dut)
     await spi_write(dut, 1, [0x01])
     await spi_write(dut, 4, [0x0f])
@@ -367,8 +367,8 @@ async def test_host_in_error_paths(dut):
     result = (await spi_read(dut, 7, 1))[0]
     assert (result >> 4) & 7 == 2, f"BAD result {result:#x}"
 
-    # 9-byte data packet -> ERR=OVERFLOW (3)
-    payload9 = list(range(9))
+    # 65-byte data packet -> ERR=OVERFLOW (3)
+    payload9 = list(range(65))
     resp = cocotb.start_soon(responder(usb_bus.data_bytes(0xB, payload9)))
     await spi_write(dut, 6, [0x60])
     await resp
@@ -522,5 +522,138 @@ async def test_device_in_and_control(dut):
     await ClockCycles(dut.clk, 20)
     assert (await spi_read(dut, 0x0B, 2)) == [0x23, 0x01]
     assert (await spi_read(dut, 3, 1))[0] & 0x02
+
+    assert int(dut.contention_count.value) == 0
+
+
+@cocotb.test()
+async def test_buffer_lengths(dut):
+    """64-byte packet buffer: length sweep 0/1/8/63/64 for host OUT/IN and
+    device OUT/IN, plus pointer wrap after a full-buffer transfer."""
+    await _tb_init(dut)
+    await spi_write(dut, 1, [0x01])
+    await spi_write(dut, 4, [0x0f])
+    await spi_write(dut, 3, [0x0f])
+    await spi_write(dut, 5, [0x00])
+
+    def payload(n, seed=0):
+        return [(seed + i) & 0xFF for i in range(n)]
+
+    # ---------- host OUT: DUT transmits buffer ----------
+    async def host_out(n):
+        data = payload(n)
+        # fill buffer: DATA writes do not move the pointer; write LEN last
+        await spi_write(dut, 9, [0])
+        for b in data:
+            await spi_write(dut, 0x0A, [b])
+        await spi_write(dut, 9, [n])
+
+        async def responder():
+            pkt = await usb_bus.recv_packet(dut)
+            assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x1), f"OUT token {pkt}"
+            pkt = await usb_bus.recv_packet(dut)
+            assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x3), f"DATA0 {pkt}"
+            assert pkt[1:-2] == data, f"payload len {n}"
+            assert pkt[-2:] == list(usb_bus.data_bytes(0x3, data)[-2:]), "CRC16"
+            await ClockCycles(dut.clk, 10)
+            await usb_bus.send_packet(dut, [0x80, usb_bus.pid_byte(0x2)])
+        resp = cocotb.start_soon(responder())
+        await spi_write(dut, 6, [0x10])  # OUT op=1, DATA0
+        await resp
+        assert await _wait_done(dut)
+        assert ((await spi_read(dut, 7, 1))[0] & 0x0f) == 0x2
+
+    for n in (0, 1, 8, 63, 64):
+        await host_out(n)
+
+    # ---------- host IN: model sends, DUT buffers ----------
+    async def host_in(n):
+        data = payload(n, seed=0x40 + n)
+
+        async def responder():
+            pkt = await usb_bus.recv_packet(dut)
+            assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x9)
+            await ClockCycles(dut.clk, 10)
+            await usb_bus.send_packet(dut, usb_bus.data_bytes(0xB, data))
+            pkt = await usb_bus.recv_packet(dut)
+            assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"no ACK len {n} {pkt}"
+        resp = cocotb.start_soon(responder())
+        await spi_write(dut, 6, [0x60])  # IN
+        await resp
+        assert await _wait_done(dut)
+        assert (await spi_read(dut, 9, 1))[0] == n
+        # pointer was cleared by the SIE before receiving; read back
+        assert await spi_read(dut, 0x0A, n) == data
+
+    for n in (0, 1, 8, 63, 64):
+        await host_in(n)
+
+    assert int(dut.contention_count.value) == 0
+
+
+@cocotb.test()
+async def test_device_buffer_lengths(dut):
+    """Device mode: SETUP/OUT receive and IN transmit at lengths up to 64,
+    and pointer wrap back to 0 between transfers."""
+    await _tb_init(dut)
+    await spi_write(dut, 1, [0x02])
+    await spi_write(dut, 4, [0x0f])
+    await spi_write(dut, 3, [0x0f])
+    await spi_write(dut, 5, [0x00])
+
+    def payload(n, seed=0):
+        return [(seed + i) & 0xFF for i in range(n)]
+
+    # ---------- device OUT receive ----------
+    async def dev_out(n):
+        data = payload(n, seed=n)
+        await spi_write(dut, 6, [0x10])  # RX arm ep0
+        await usb_bus.send_packet(dut, usb_bus.token_bytes(0x1, 0, 0))
+        await ClockCycles(dut.clk, 6)
+        await usb_bus.send_packet(dut, usb_bus.data_bytes(0x3, data))
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"no ACK len {n} {pkt}"
+        assert await _wait_done(dut)
+        assert (await spi_read(dut, 9, 1))[0] == n
+        assert await spi_read(dut, 0x0A, n) == data
+
+    for n in (0, 1, 8, 63, 64):
+        await dev_out(n)
+
+    # ---------- device IN transmit ----------
+    async def dev_in(n):
+        data = payload(n, seed=0xA0 + n)
+        await spi_write(dut, 9, [0])
+        for b in data:
+            await spi_write(dut, 0x0A, [b])
+        await spi_write(dut, 9, [n])
+        await spi_write(dut, 6, [0x60])  # TX arm, DATA1
+        await usb_bus.send_packet(dut, usb_bus.token_bytes(0x9, 0, 0))
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0xB), f"no DATA1 len {n} {pkt}"
+        assert pkt[1:-2] == data, f"device TX payload len {n}"
+        assert pkt[-2:] == list(usb_bus.data_bytes(0xB, data)[-2:]), "CRC16"
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, [0x80, usb_bus.pid_byte(0x2)])
+        assert await _wait_done(dut)
+
+    for n in (0, 1, 8, 63, 64):
+        await dev_in(n)
+
+    # ---------- pointer wrap: after a 64-byte transfer, next starts at 0 ----------
+    await dev_out(64)
+    await dev_out(2)
+
+    # ---------- device OUT with 65 bytes: completes, only 64 stored ----------
+    await spi_write(dut, 6, [0x10])
+    await usb_bus.send_packet(dut, usb_bus.token_bytes(0x1, 0, 0))
+    await ClockCycles(dut.clk, 6)
+    await usb_bus.send_packet(dut, usb_bus.data_bytes(0x3, payload(65)))
+    pkt = await usb_bus.recv_packet(dut)
+    assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"no ACK on 65B {pkt}"
+    assert await _wait_done(dut)
+    # existing behavior: first 64 bytes land in the buffer, LEN reports actual count
+    assert (await spi_read(dut, 9, 1))[0] == 65
+    assert await spi_read(dut, 0x0A, 64) == payload(64)
 
     assert int(dut.contention_count.value) == 0

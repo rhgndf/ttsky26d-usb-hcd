@@ -108,7 +108,7 @@ async def recv_packet(dut, limit_cycles=100000):
             break
     if not started:
         return None
-    for _ in range(16 * 128 + 256):
+    for _ in range(16 * 640 + 256):  # ~51 us, covers a 70-byte packet
         await Timer(step, unit="ps")
         pins = int(dut.uio_in.value)
         samples.append((pins & 1, (pins >> 1) & 1))

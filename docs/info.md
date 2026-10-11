@@ -13,9 +13,9 @@ receive with clock recovery, NRZI, bit (un)stuffing, SYNC/EOP, CRC5/CRC16
 generation and checking, token/handshake generation, turnaround timeouts,
 1 ms SOF generation, address/endpoint matching and attach/reset detection.
 Software does everything else (enumeration, data toggles, NAK retries,
-scheduling). There is one 8-byte packet buffer, so all endpoints must use
-`wMaxPacketSize` <= 8 (the full-speed minimum for EP0 is 8, so EP0 always
-works; a larger device endpoint must be avoided or the transfer fails with
+scheduling). There is one 64-byte packet buffer, so all endpoints must use
+`wMaxPacketSize` <= 64 (the full-speed maximum, so any FS endpoint works;
+a larger device endpoint must be avoided or the transfer fails with
 `OVERFLOW`).
 
 The clock must be **48 MHz** (4 samples per USB bit, 0.25 % accuracy).
@@ -53,8 +53,8 @@ Unlisted registers read 0. Reset value of every register is 0 unless noted.
 | 0x6 | `CMD` | RW | [3:0] `EP` · [5:4] `OP` · [6] `DATA1` · [7] `ANY` — writing starts an operation, see below |
 | 0x7 | `RESULT` | R | [3:0] `PID` · [6:4] `ERR` · [7] `RX_DATA1` |
 | 0x8 | `TOKEN` | R | device: last token addressed to us: [3:0] EP · [7:4] PID |
-| 0x9 | `LEN` | RW | [3:0] packet length 0-8. Writing resets the buffer pointer to 0 |
-| 0xA | `DATA` | RW | packet buffer port: accesses `buf[ptr]`, then `ptr = (ptr+1) mod 8`. Non-incrementing in bursts |
+| 0x9 | `LEN` | RW | [6:0] packet length 0-64 (values > 64 are undefined). Writing resets the buffer pointer to 0 |
+| 0xA | `DATA` | RW | packet buffer port: accesses `buf[ptr]`, then `ptr = (ptr+1) mod 64`. Non-incrementing in bursts |
 | 0xB | `FRAME_L` | R | frame number [7:0]: host: last SOF sent; device: last SOF received |
 | 0xC | `FRAME_H` | R | [2:0] frame number [10:8] |
 
@@ -69,7 +69,7 @@ NAK=0xA, STALL=0xE.
 
 `RESULT.ERR`: 0 `OK`, 1 `TIMEOUT` (no response within 20 bit times),
 2 `BAD` (CRC, bit-stuff, PID-check or framing error), 3 `OVERFLOW` (data
-packet longer than 8 bytes), 4 `UNEXPECTED` (valid packet of the wrong type).
+packet longer than 64 bytes), 4 `UNEXPECTED` (valid packet of the wrong type).
 
 #### Host mode (`CTRL.HOST=1`)
 

@@ -25,7 +25,7 @@ module tt_um_rhgndf_usb_hcd (
     wire [3:0] cmd_ep;
     wire [1:0] cmd_op;
     wire cmd_data1, cmd_any, cmd_wr;
-    wire [3:0] len_reg;
+    wire [6:0] len_reg;
     wire [7:0] buf_rdata;
     wire [3:0] irq;
     wire irq_pin;
@@ -37,7 +37,8 @@ module tt_um_rhgndf_usb_hcd (
     wire [7:0] sie_buf_wdata;
     wire sie_op_done, sie_res_wr, sie_tok_wr, sie_len_wr;
     wire [7:0] sie_res_val, sie_tok_val;
-    wire [3:0] sie_len_val, sie_irq_set;
+    wire [3:0] sie_irq_set;
+    wire [6:0] sie_len_val;
     wire usb_tx_dp, usb_tx_dm, usb_tx_oe, usb_tx_active;
     wire sie_token;
 

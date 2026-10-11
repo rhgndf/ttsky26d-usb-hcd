@@ -40,7 +40,7 @@ module usb_regs (
     output reg         cmd_data1,
     output reg         cmd_any,
     output reg         cmd_wr,
-    output reg  [3:0]  len_reg,
+    output reg  [6:0]  len_reg,
     output wire [7:0]  buf_rdata,
     input  wire        sie_buf_we,
     input  wire [7:0]  sie_buf_wdata,
@@ -52,7 +52,7 @@ module usb_regs (
     input  wire        sie_tok_wr,
     input  wire [7:0]  sie_tok_val,
     input  wire        sie_len_wr,
-    input  wire [3:0]  sie_len_val,
+    input  wire [6:0]  sie_len_val,
     input  wire [3:0]  sie_irq_set,
 
     output reg  [3:0]  irq,
@@ -67,8 +67,8 @@ module usb_regs (
     reg [3:0] irq_en;
     reg [7:0] result;
     reg [7:0] token;
-    reg [7:0] buffer_mem [0:7];
-    reg [2:0] bufptr;
+    reg [7:0] buffer_mem [0:63];
+    reg [5:0] bufptr;
 
     // select active port for writes / side effects
     wire        sel_a = a_active;
@@ -98,7 +98,7 @@ module usb_regs (
             ADDR_CMD:    rdata_r = {cmd_any, cmd_data1, cmd_op, cmd_ep};
             ADDR_RESULT: rdata_r = result;
             ADDR_TOKEN:  rdata_r = token;
-            ADDR_LEN:    rdata_r = {4'b0, len_reg};
+            ADDR_LEN:    rdata_r = {1'b0, len_reg};
             ADDR_DATA:   rdata_r = buffer_mem[bufptr];
             ADDR_FL:     rdata_r = frame[7:0];
             ADDR_FH:     rdata_r = {5'b0, frame[10:8]};
@@ -128,7 +128,7 @@ module usb_regs (
             cmd_wr <= 0;
 
             // buffer pointer
-            if (sie_bufptr_clr || len_wr)
+            if (sie_bufptr_clr || len_wr || sie_len_wr)
                 bufptr <= 0;
             else if (buf_inc)
                 bufptr <= bufptr + 1;
@@ -153,7 +153,7 @@ module usb_regs (
                             cmd_wr    <= 1;
                         end
                     end
-                    ADDR_LEN: len_reg <= wdata[3:0];
+                    ADDR_LEN: len_reg <= wdata[6:0];
                     default: ;
                 endcase
             end

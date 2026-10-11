@@ -19,7 +19,7 @@ module usb_sie (
     input  wire        cmd_data1,
     input  wire        cmd_any,
     input  wire        cmd_wr,
-    input  wire [3:0]  len_reg,
+    input  wire [6:0]  len_reg,
     input  wire [7:0]  buf_rdata,
     output reg         busy,
     output reg         dp_sync,
@@ -36,7 +36,7 @@ module usb_sie (
     output reg         tok_wr,
     output wire [7:0]  tok_val,
     output reg         len_wr,
-    output wire [3:0]  len_val,
+    output wire [6:0]  len_val,
     output reg  [3:0]  irq_set,
     output wire        tx_dp,
     output wire        tx_dm,
@@ -72,7 +72,7 @@ module usb_sie (
     reg [2:0] bitcnt;
     reg [2:0] ones;
     reg [15:0] crc;
-    reg [3:0] rxcnt;         // bytes completed this packet (0=SYNC,1=PID,..)
+    reg [6:0] rxcnt;         // bytes completed this packet (0=SYNC,1=PID,..)
     reg [3:0] rx_pid;
     reg       rx_pid_ok;
     reg [7:0] tok_lo;        // first byte after PID
@@ -81,8 +81,8 @@ module usb_sie (
     // ---- TX engine ----
     reg [1:0] tx_state;
     reg [1:0] tx_phase;
-    reg [6:0] tx_bit_index;
-    reg [3:0] tx_len;        // body bytes (data pkts); unused for token/hs
+    reg [9:0] tx_bit_index;
+    reg [6:0] tx_len;        // body bytes (data pkts); unused for token/hs
     reg [1:0] tx_crc_mode;   // 0 none, 1 crc16, 2 crc5
     reg tx_stuff;
     reg tx_line_dp, tx_line_dm;
@@ -114,16 +114,16 @@ module usb_sie (
     assign len_val = rxcnt - 4;
 
     // TX emit boundaries derived from mode/len
-    wire [6:0] tx_body_end = (tx_crc_mode == 2) ? 7'd27 : 7'd16 + {tx_len, 3'b0};
-    wire [6:0] tx_end      = (tx_crc_mode == 0) ? 7'd16 :
-                             (tx_crc_mode == 2) ? 7'd32 : 7'd32 + {tx_len, 3'b0};
+    wire [9:0] tx_body_end = (tx_crc_mode == 2) ? 10'd27 : 10'd16 + {tx_len, 3'b0};
+    wire [9:0] tx_end      = (tx_crc_mode == 0) ? 10'd16 :
+                             (tx_crc_mode == 2) ? 10'd32 : 10'd32 + {tx_len, 3'b0};
 
     // Queue a packet for transmission.
     task tx_job;
         input [1:0] kind;
         input [3:0] pid;
         input [10:0] tok;
-        input [3:0] dlen;
+        input [6:0] dlen;
         begin
             tx_pid <= pid;
             tx_tok <= tok;
@@ -349,7 +349,7 @@ module usb_sie (
                         // byte completion
                         if (bitcnt == 7 && !(ones == 6 && !rx_bit)) begin
                             bitcnt <= 0;
-                            if (rxcnt != 15)
+                            if (rxcnt != 127)
                                 rxcnt <= rxcnt + 1;
                             if (rxcnt == 1) begin
                                 rx_pid <= rx_newbyte[3:0];
@@ -357,7 +357,7 @@ module usb_sie (
                             end else begin
                                 if (rxcnt == 2)
                                     tok_lo <= rx_newbyte;
-                                if (rxcnt >= 2 && rxcnt < 10 && rx_accept) begin
+                                if (rxcnt >= 2 && rxcnt < 66 && rx_accept) begin
                                     buf_we <= 1;
                                     buf_wdata <= rx_newbyte;
                                 end
@@ -451,7 +451,7 @@ module usb_sie (
                         res_val <= {1'b0, 4'b0, rx_pid};
                         irq_set[0] <= 1;
                     end else if (tstate == S_WAIT && (rx_pid == 4'h3 || rx_pid == 4'hb)) begin
-                        if (rxcnt > 12) begin
+                        if (rxcnt > 68) begin
                             busy <= 0;
                             tstate <= S_IDLE;
                             op_done <= 1;
