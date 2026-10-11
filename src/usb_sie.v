@@ -69,7 +69,7 @@ module usb_sie (
     reg tx_stuff;
     reg tx_line_dp, tx_line_dm;
     reg tx_done;
-    reg [7:0] tx_mem [0:15];
+    reg [7:0] tx_mem [0:11];
     reg [6:0] tx_nbits;
     reg [3:0] tx_payload_len;
     reg [7:0] tx_payload [0:7];
@@ -156,6 +156,8 @@ module usb_sie (
             tx_mem[1] = pid_byte;
             for (x=0; x<8; x=x+1)
                 if (x<n) tx_mem[x+2] = tx_payload[x];
+            tx_mem[10] = 8'h00;
+            tx_mem[11] = 8'h00;
             crc <= 16'hffff;
             tx_crc_mode <= 1;
             tx_crc_end <= 16 + {n,3'b000};
