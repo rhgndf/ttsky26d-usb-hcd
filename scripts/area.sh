@@ -16,9 +16,7 @@ IMAGE=ghcr.io/librelane/librelane:3.0.14
 docker run --rm -i -v "$REPO/src":/src -v "$LIB":/liberty.lib:ro "$IMAGE" \
     yosys -Q -T -p "
         read_verilog /src/*.v;
-        hierarchy -check -top $TOP;
-        proc; flatten; opt;
-        techmap; opt;
+        synth -top $TOP -flatten;
         dfflibmap -liberty /liberty.lib;
         abc -liberty /liberty.lib;
         stat -liberty /liberty.lib;

@@ -82,45 +82,31 @@ module usb_regs (
     wire len_wr  = wr_en && (waddr == ADDR_LEN);
     wire buf_inc = data_wr || data_rd || sie_buf_inc || sie_buf_we;
 
-    assign buf_rdata = buffer_mem[sie_bufptr_clr ? 3'b000 : bufptr];
+    assign buf_rdata = buffer_mem[bufptr];
 
-    reg [7:0] a_rdata_r, b_rdata_r;
+    // single read port muxed by interface: SPI when CS_N low, else I2C
+    reg [7:0] rdata_r;
+    wire [3:0] raddr = sel_a ? a_addr : b_addr;
     always @* begin
-        case (a_addr)
-            ADDR_ID:     a_rdata_r = 8'h5B;
-            ADDR_CTRL:   a_rdata_r = {2'b0, ctrl};
-            ADDR_STATUS: a_rdata_r = {3'b0, vbus, busy, se0_long, dp_sync, dm_sync};
-            ADDR_IRQ:    a_rdata_r = {4'b0, irq};
-            ADDR_IRQ_EN: a_rdata_r = {4'b0, irq_en};
-            ADDR_ADDR:   a_rdata_r = {1'b0, addr_reg};
-            ADDR_CMD:    a_rdata_r = {cmd_any, cmd_data1, cmd_op, cmd_ep};
-            ADDR_RESULT: a_rdata_r = result;
-            ADDR_TOKEN:  a_rdata_r = token;
-            ADDR_LEN:    a_rdata_r = {4'b0, len_reg};
-            ADDR_DATA:   a_rdata_r = buffer_mem[sie_bufptr_clr ? 3'b000 : bufptr];
-            ADDR_FL:     a_rdata_r = frame[7:0];
-            ADDR_FH:     a_rdata_r = {5'b0, frame[10:8]};
-            default:     a_rdata_r = 8'h00;
-        endcase
-        case (b_addr)
-            ADDR_ID:     b_rdata_r = 8'h5B;
-            ADDR_CTRL:   b_rdata_r = {2'b0, ctrl};
-            ADDR_STATUS: b_rdata_r = {3'b0, vbus, busy, se0_long, dp_sync, dm_sync};
-            ADDR_IRQ:    b_rdata_r = {4'b0, irq};
-            ADDR_IRQ_EN: b_rdata_r = {4'b0, irq_en};
-            ADDR_ADDR:   b_rdata_r = {1'b0, addr_reg};
-            ADDR_CMD:    b_rdata_r = {cmd_any, cmd_data1, cmd_op, cmd_ep};
-            ADDR_RESULT: b_rdata_r = result;
-            ADDR_TOKEN:  b_rdata_r = token;
-            ADDR_LEN:    b_rdata_r = {4'b0, len_reg};
-            ADDR_DATA:   b_rdata_r = buffer_mem[sie_bufptr_clr ? 3'b000 : bufptr];
-            ADDR_FL:     b_rdata_r = frame[7:0];
-            ADDR_FH:     b_rdata_r = {5'b0, frame[10:8]};
-            default:     b_rdata_r = 8'h00;
+        case (raddr)
+            ADDR_ID:     rdata_r = 8'h5B;
+            ADDR_CTRL:   rdata_r = {2'b0, ctrl};
+            ADDR_STATUS: rdata_r = {3'b0, vbus, busy, se0_long, dp_sync, dm_sync};
+            ADDR_IRQ:    rdata_r = {4'b0, irq};
+            ADDR_IRQ_EN: rdata_r = {4'b0, irq_en};
+            ADDR_ADDR:   rdata_r = {1'b0, addr_reg};
+            ADDR_CMD:    rdata_r = {cmd_any, cmd_data1, cmd_op, cmd_ep};
+            ADDR_RESULT: rdata_r = result;
+            ADDR_TOKEN:  rdata_r = token;
+            ADDR_LEN:    rdata_r = {4'b0, len_reg};
+            ADDR_DATA:   rdata_r = buffer_mem[bufptr];
+            ADDR_FL:     rdata_r = frame[7:0];
+            ADDR_FH:     rdata_r = {5'b0, frame[10:8]};
+            default:     rdata_r = 8'h00;
         endcase
     end
-    assign a_rdata = a_rdata_r;
-    assign b_rdata = b_rdata_r;
+    assign a_rdata = rdata_r;
+    assign b_rdata = rdata_r;
     assign irq_pin = |(irq & irq_en);
 
     always @(posedge clk) begin
@@ -143,7 +129,7 @@ module usb_regs (
 
             // buffer pointer
             if (sie_bufptr_clr || len_wr)
-                bufptr <= buf_inc ? 1 : 0;
+                bufptr <= 0;
             else if (buf_inc)
                 bufptr <= bufptr + 1;
 
@@ -151,7 +137,7 @@ module usb_regs (
             if (data_wr)
                 buffer_mem[bufptr] <= wdata;
             else if (sie_buf_we)
-                buffer_mem[sie_bufptr_clr ? 3'b000 : bufptr] <= sie_buf_wdata;
+                buffer_mem[bufptr] <= sie_buf_wdata;
 
             if (wr_en) begin
                 case (waddr)

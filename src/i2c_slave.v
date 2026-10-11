@@ -17,8 +17,8 @@ module i2c_slave (
     output reg        sda_oe,     // open-drain: 1 = drive SDA low
     output reg  [3:0] addr,
     output wire [7:0] wdata,
-    output reg        we,
-    output reg        re,
+    output wire       we,
+    output wire       re,
     input  wire [7:0] rdata
 );
 
@@ -60,19 +60,19 @@ module i2c_slave (
                ST_TXA  = 6, ST_WAIT = 7, ST_ACKB = 8, ST_ACKD2 = 9;
     reg [3:0] state;
 
-    reg [7:0] sr;
+    reg [7:0] sr;         // shared shift register (rx and tx)
     reg [2:0] bit_cnt;
     reg       rw;         // 1 = master reads
     reg       got_ptr;    // register pointer received
-    reg [7:0] tx_sr;
-    reg       advance_pending;
-    reg       tx_advance_pending;
-    reg       tx_prefetch_pending;
     reg       master_ack;
 
-    reg [7:0] wdata_reg;
-    assign wdata = wdata_reg; // byte captured at the 8th SCL rising edge
-    wire [7:0] in_byte = {sr[6:0], sda_f};
+    // byte completes at the 8th SCL rising edge; stays valid while SCL is
+    // high, which is when we commits
+    assign wdata = {sr[6:0], sda_f};
+    wire [7:0] in_byte = wdata;
+    // Combinational strobes: coincident with the still-current addr
+    assign we = (state == ST_RX) && scl_rise && (bit_cnt == 7) && got_ptr;
+    assign re = (state == ST_TXA) && scl_rise;
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -83,32 +83,8 @@ module i2c_slave (
             got_ptr <= 0;
             addr    <= 0;
             sda_oe  <= 0;
-            we      <= 0;
-            re      <= 0;
-            tx_sr   <= 0;
-            advance_pending <= 0;
-            tx_advance_pending <= 0;
-            tx_prefetch_pending <= 0;
             master_ack <= 0;
-            wdata_reg <= 0;
         end else begin
-            we <= 0;
-            re <= 0;
-            if (advance_pending) begin
-                if (addr != 4'hA)
-                    addr <= addr + 1;
-                advance_pending <= 0;
-            end
-            if (tx_advance_pending) begin
-                if (addr != 4'hA)
-                    addr <= addr + 1;
-                tx_prefetch_pending <= 1;
-                tx_advance_pending <= 0;
-            end
-            if (tx_prefetch_pending) begin
-                tx_sr <= rdata;
-                tx_prefetch_pending <= 0;
-            end
 
             if (stop_ev) begin
                 state   <= ST_IDLE;
@@ -141,7 +117,7 @@ module i2c_slave (
                         sda_oe <= 1; // ACK, asserted only in the low half
                         if (rw) begin
                             state  <= ST_TX;
-                            tx_sr  <= rdata; // prefetch read byte
+                            sr     <= rdata; // prefetch read byte
                         end else begin
                             state  <= ST_ACKB;
                         end
@@ -161,9 +137,8 @@ module i2c_slave (
                                 got_ptr <= 1;
                                 addr    <= in_byte[3:0];
                             end else begin
-                                wdata_reg <= in_byte;
-                                we <= 1;
-                                advance_pending <= 1;
+                                if (addr != 4'hA)
+                                    addr <= addr + 1;
                             end
                         end
                     end
@@ -180,8 +155,8 @@ module i2c_slave (
                     ST_TX: begin
                         // Advance to the next bit on SCL falling edges.
                         if (scl_fall) begin
-                            sda_oe  <= ~tx_sr[7];
-                            tx_sr   <= {tx_sr[6:0], 1'b1};
+                            sda_oe  <= ~sr[7];
+                            sr      <= {sr[6:0], 1'b1};
                             bit_cnt <= bit_cnt + 1;
                             if (bit_cnt == 7) begin
                                 bit_cnt <= 0;
@@ -194,14 +169,15 @@ module i2c_slave (
                     ST_TXA: begin
                         if (scl_rise) begin
                             // The ninth clock completes the byte even for a NAK.
-                            re <= 1;
                             master_ack <= !sda_f;
-                            tx_advance_pending <= 1;
+                            if (addr != 4'hA)
+                                addr <= addr + 1;
                         end
                         if (scl_fall) begin
                             if (master_ack) begin
                                 state <= ST_TX;
                                 bit_cnt <= 0;
+                                sr <= rdata; // prefetch next byte (addr settled)
                             end else begin
                                 state <= ST_WAIT;
                             end
