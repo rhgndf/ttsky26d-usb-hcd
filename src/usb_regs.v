@@ -40,7 +40,8 @@ module usb_regs (
     output reg         cmd_data1,
     output reg         cmd_any,
     output reg         cmd_wr,
-    output reg  [6:0]  len_reg,
+    output wire [6:0]  len_reg,
+    output wire        iso,
     output wire [7:0]  buf_rdata,
     input  wire        sie_buf_we,
     input  wire [7:0]  sie_buf_wdata,
@@ -62,18 +63,29 @@ module usb_regs (
     localparam ADDR_ID = 4'h0, ADDR_CTRL = 4'h1, ADDR_STATUS = 4'h2,
                ADDR_IRQ = 4'h3, ADDR_IRQ_EN = 4'h4, ADDR_ADDR = 4'h5,
                ADDR_CMD = 4'h6, ADDR_RESULT = 4'h7, ADDR_TOKEN = 4'h8,
-               ADDR_LEN = 4'h9, ADDR_DATA = 4'hA, ADDR_FL = 4'hB, ADDR_FH = 4'hC;
+               ADDR_LEN = 4'h9, ADDR_DATA = 4'hA, ADDR_FL = 4'hB,
+               ADDR_FH = 4'hC, ADDR_BUF = 4'hD, ADDR_HBUF = 4'hE;
 
     reg [3:0] irq_en;
     reg [7:0] result;
     reg [7:0] token;
-    reg [5:0] bufptr;
 
-    // 64-byte packet buffer: tnt's rf_top register file, 32 words x 32 bits,
-    // only the low 16 bits of each word used (one byte per half word).
+    // BUF: [1] SBUF (SIE buffer) [2] AUTO_SWAP [3] ISO
+    reg       sbuf, auto_swap;
+    reg       iso_reg;
+    // HBUF: [0] buffer accessed by DATA/LEN over SPI/I2C
+    reg       hbuf;
+    reg [6:0] len0, len1;
+    reg [5:0] sptr, hptr;
+
+    assign iso     = iso_reg;
+    assign len_reg = sbuf ? len1 : len0;
+
+    // 128-byte packet buffer: tnt's rf_top register file, 32 words x 32 bits;
+    // buffer 0 is the low half of each word, buffer 1 the high half.
     // Synchronous read: both read ports are addressed with the next-state
-    // word address so the outputs always hold the word at bufptr.
-    reg  [15:0] fw_data;
+    // word address so the outputs always hold the word at the pointer.
+    reg  [31:0] fw_data;
     reg  [4:0]  fw_addr;
     reg         fw_valid;
     wire [31:0] ra_data, rb_data;
@@ -88,33 +100,52 @@ module usb_regs (
     wire data_wr = wr_en && (waddr == ADDR_DATA);
     wire data_rd = rd_en && (waddr == ADDR_DATA);
     wire len_wr  = wr_en && (waddr == ADDR_LEN);
-    wire buf_inc = data_wr || data_rd || sie_buf_inc || sie_buf_we;
-    wire buf_clr = sie_bufptr_clr || len_wr || sie_len_wr;
-    wire [5:0] bufptr_next = buf_clr ? 6'd0 : buf_inc ? bufptr + 6'd1 : bufptr;
+    wire hbuf_wr = wr_en && (waddr == ADDR_HBUF);
 
-    // read-modify-write: merge the new byte into the word at bufptr
-    wire        buf_we   = data_wr || sie_buf_we;
-    wire [7:0]  buf_byte = data_wr ? wdata : sie_buf_wdata;
-    wire [15:0] cur_word = (fw_valid && fw_addr == bufptr[5:1])
-                           ? fw_data : rb_data[15:0];
-    wire [15:0] new_word = bufptr[0] ? {buf_byte, cur_word[7:0]}
-                                     : {cur_word[15:8], buf_byte};
+    // ---- pointers ----
+    wire [5:0] sptr_next = sie_bufptr_clr ? 6'd0 :
+                           (sie_buf_inc || sie_buf_we) ? sptr + 6'd1 : sptr;
+
+    // one-entry pending host write: a host DATA write landing in the same
+    // cycle as an SIE write is deferred by one cycle; enough because SIE
+    // writes are >=32 clocks apart and host DATA accesses >= ~96.
+    reg       hpend;
+    reg [7:0] hpend_byte;
+    wire      host_issue = !sie_buf_we && (data_wr || hpend);
+    wire [7:0] host_byte = hpend ? hpend_byte : wdata;
+
+    wire hptr_clr = len_wr || hbuf_wr || (sie_len_wr && sbuf == hbuf);
+    wire [5:0] hptr_next = hptr_clr ? 6'd0 :
+                           (data_rd || host_issue) ? hptr + 6'd1 : hptr;
+
+    // ---- write path (RMW into the full 32-bit word) ----
+    wire [4:0] w_word  = sie_buf_we ? sptr[5:1] : hptr[5:1];
+    wire       w_buf   = sie_buf_we ? sbuf : hbuf;
+    wire       w_byte  = sie_buf_we ? sptr[0] : hptr[0];
+    wire [7:0] w_data8 = sie_buf_we ? sie_buf_wdata : host_byte;
+    wire       buf_we  = sie_buf_we || host_issue;
+
+    wire [31:0] word_a = (fw_valid && fw_addr == sptr[5:1]) ? fw_data : ra_data;
+    wire [31:0] word_b = (fw_valid && fw_addr == hptr[5:1]) ? fw_data : rb_data;
+    wire [31:0] cur_word = sie_buf_we ? word_a : word_b;
+    wire [31:0] new_word = cur_word & ~(32'hff << ({w_buf, w_byte} * 8))
+                           | ({24'b0, w_data8} << ({w_buf, w_byte} * 8));
 
     rf_top i_rf (
-        .w_data  ({16'b0, new_word}),
-        .w_addr  (bufptr[5:1]),
+        .w_data  (new_word),
+        .w_addr  (w_word),
         .w_ena   (buf_we),
-        .ra_addr (bufptr_next[5:1]),
-        .rb_addr (bufptr_next[5:1]),
+        .ra_addr (sptr_next[5:1]),
+        .rb_addr (hptr_next[5:1]),
         .ra_data (ra_data),
         .rb_data (rb_data),
         .clk     (clk)
     );
 
-    wire [15:0] buf_word = (fw_valid && fw_addr == bufptr[5:1])
-                           ? fw_data : ra_data[15:0];
-    wire [7:0] buf_byte_rd = bufptr[0] ? buf_word[15:8] : buf_word[7:0];
-    assign buf_rdata = buf_byte_rd;
+    // SIE read data: byte of the port-A word selected by SBUF/sptr[0]
+    assign buf_rdata = word_a >> ({sbuf, sptr[0]} * 8);
+    // host DATA read: byte of the port-B word selected by HBUF/hptr[0]
+    wire [7:0] host_rdata = word_b >> ({hbuf, hptr[0]} * 8);
 
     // single read port muxed by interface: SPI when CS_N low, else I2C
     reg [7:0] rdata_r;
@@ -130,10 +161,12 @@ module usb_regs (
             ADDR_CMD:    rdata_r = {cmd_any, cmd_data1, cmd_op, cmd_ep};
             ADDR_RESULT: rdata_r = result;
             ADDR_TOKEN:  rdata_r = token;
-            ADDR_LEN:    rdata_r = {1'b0, len_reg};
-            ADDR_DATA:   rdata_r = buf_byte_rd;
+            ADDR_LEN:    rdata_r = {1'b0, hbuf ? len1 : len0};
+            ADDR_DATA:   rdata_r = host_rdata;
             ADDR_FL:     rdata_r = frame[7:0];
             ADDR_FH:     rdata_r = {5'b0, frame[10:8]};
+            ADDR_BUF:    rdata_r = {4'b0, iso_reg, auto_swap, sbuf, 1'b0};
+            ADDR_HBUF:   rdata_r = {7'b0, hbuf};
             default:     rdata_r = 8'h00;
         endcase
     end
@@ -151,22 +184,38 @@ module usb_regs (
             cmd_op    <= 0;
             cmd_data1 <= 0;
             cmd_any   <= 0;
-            len_reg   <= 0;
+            len0      <= 0;
+            len1      <= 0;
             result    <= 0;
             token     <= 0;
-            bufptr    <= 0;
+            sbuf      <= 0;
+            auto_swap <= 0;
+            iso_reg   <= 0;
+            hbuf      <= 0;
+            sptr      <= 0;
+            hptr      <= 0;
+            hpend     <= 0;
+            hpend_byte <= 0;
             fw_valid  <= 0;
             cmd_wr    <= 0;
         end else begin
             cmd_wr <= 0;
 
-            // buffer pointer
-            bufptr <= bufptr_next;
+            sptr <= sptr_next;
+            hptr <= hptr_next;
+
+            // deferred host DATA write on SIE-write collision
+            if (sie_buf_we && data_wr) begin
+                hpend <= 1;
+                hpend_byte <= wdata;
+            end else if (hpend && !sie_buf_we) begin
+                hpend <= 0;
+            end
 
             // write forwarding for read-during-write (macro uncharacterized)
             fw_valid <= buf_we;
             if (buf_we) begin
-                fw_addr <= bufptr[5:1];
+                fw_addr <= w_word;
                 fw_data <= new_word;
             end
 
@@ -184,7 +233,16 @@ module usb_regs (
                             cmd_wr    <= 1;
                         end
                     end
-                    ADDR_LEN: len_reg <= wdata[6:0];
+                    ADDR_LEN: begin
+                        if (hbuf) len1 <= wdata[6:0];
+                        else      len0 <= wdata[6:0];
+                    end
+                    ADDR_BUF: begin
+                        sbuf      <= wdata[1];
+                        auto_swap <= wdata[2];
+                        iso_reg   <= wdata[3];
+                    end
+                    ADDR_HBUF: hbuf <= wdata[0];
                     default: ;
                 endcase
             end
@@ -198,10 +256,20 @@ module usb_regs (
 
             if (sie_res_wr) result <= sie_res_val;
             if (sie_tok_wr) token  <= sie_tok_val;
-            if (sie_len_wr) len_reg <= sie_len_val;
+            // sie_len_wr arrives the same cycle as op_done: the LEN write
+            // lands in the OLD SBUF (nonblocking), before any auto-swap.
+            if (sie_len_wr) begin
+                if (sbuf) len1 <= sie_len_val;
+                else      len0 <= sie_len_val;
+            end
+
+            // AUTO_SWAP: toggle SBUF on a completed non-NAK/non-STALL op
+            if (sie_op_done && sie_res_wr && auto_swap &&
+                sie_res_val[6:4] == 3'b0 &&
+                sie_res_val[3:0] != 4'ha && sie_res_val[3:0] != 4'he)
+                sbuf <= ~sbuf;
         end
     end
 
-    wire _unused = &{1'b0};
 
 endmodule

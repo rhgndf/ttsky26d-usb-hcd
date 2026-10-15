@@ -22,6 +22,7 @@ module usb_sie (
     input  wire        cmd_any,
     input  wire        cmd_wr,
     input  wire [6:0]  len_reg,
+    input  wire        iso,
     input  wire [7:0]  buf_rdata,
     output reg         busy,
     output reg         dp_sync,
@@ -137,6 +138,7 @@ module usb_sie (
     reg [6:0] tim;           // shared response timer (timeout 80)
     reg [3:0] pend_hs;       // device: handshake queued for data EOP
     reg [3:0] tok_pid;       // device: PID of the token that opened this op
+    reg       pend_iso;      // device: current op is isochronous (no handshake)
     // host uses cmd_op/cmd_ep/cmd_data1 live: regs freeze them while busy
     reg [15:0] sof_timer;
     reg        sof_pending;
@@ -219,6 +221,7 @@ module usb_sie (
             tstate <= S_IDLE;
             tim <= 0;
             pend_hs <= 0;
+            pend_iso <= 0;
             sof_timer <= 0;
             sof_pending <= 0;
             frame <= 0;
@@ -388,6 +391,8 @@ module usb_sie (
                         end else if (tok_lo[7:1] == addr_reg) begin
                             tok_wr <= 1;
                             tok_pid <= rx_pid;
+                            pend_iso <= iso && tok_ep == cmd_ep &&
+                                        (rx_pid == 4'h1 || rx_pid == 4'h9);
 
                             if (rx_pid == 4'h9) begin
                                 if (cmd_op == 2 && tok_ep == cmd_ep) begin
@@ -431,7 +436,8 @@ module usb_sie (
                                 op_done <= 1;
                                 irq_set[0] <= 1;
                             end
-                            tx_job(TK_HS, pend_hs, 11'b0, 4'b0);
+                            if (!pend_iso)
+                                tx_job(TK_HS, pend_hs, 11'b0, 4'b0);
                             tstate <= S_IDLE;
                         end else begin
                             rx_accept <= 0;
@@ -466,7 +472,8 @@ module usb_sie (
                         end else if (rxcnt >= 3 && crc == 16'hb001) begin
                             len_wr <= 1;
                             rx_accept <= 0;
-                            tx_job(TK_HS, 4'h2, 11'b0, 4'b0);
+                            if (!(iso && cmd_op == 2'b10))
+                                tx_job(TK_HS, 4'h2, 11'b0, 4'b0);
                             tstate <= S_IDLE;
                             busy <= 0;
                             op_done <= 1;
@@ -507,15 +514,31 @@ module usb_sie (
                         end else if (tx_pid == 4'hd || tx_pid == 4'h1) begin
                             tx_job(TK_DATA, cmd_data1 ? 4'hb : 4'h3, 11'b0, len_reg);
                         end else if (tx_pid == 4'h3 || tx_pid == 4'hb) begin
-                            tstate <= S_WAIT;
-                            tim <= 0;
+                            if (iso && cmd_op == 2'b01) begin
+                                // iso OUT: no handshake expected
+                                busy <= 0;
+                                op_done <= 1;
+                                res_wr <= 1;
+                                res_val <= 8'h00;
+                                irq_set[0] <= 1;
+                            end else begin
+                                tstate <= S_WAIT;
+                                tim <= 0;
+                            end
                         end
                     end
                     if (tx_done && tx_pid == 4'h5)
                         irq_set[1] <= 1;
                 end
                 S_WAIT, S_DEVACK: begin
-                    if (rxact || phy_oe || txv) begin
+                    // iso device IN: complete when the data packet is sent
+                    if (tstate == S_DEVACK && pend_iso && tx_done) begin
+                        op_done <= 1;
+                        res_wr <= 1;
+                        res_val <= {1'b0, 4'b0, tok_pid};
+                        irq_set[0] <= 1;
+                        tstate <= S_IDLE;
+                    end else if (rxact || phy_oe || txv) begin
                         tim <= 0; // own transmit still in flight
                     end else if (tim == 79) begin
                         tstate <= S_IDLE;

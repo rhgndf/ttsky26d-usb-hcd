@@ -1,7 +1,7 @@
 """Register-interface and USB transaction tests for the USB controller."""
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, Timer
+from cocotb.triggers import ClockCycles, RisingEdge, Timer
 
 import usb_bus
 
@@ -666,5 +666,284 @@ async def test_device_buffer_lengths(dut):
     # existing behavior: first 64 bytes land in the buffer, LEN reports actual count
     assert (await spi_read(dut, 9, 1))[0] == 65
     assert await spi_read(dut, 0x0A, 64) == payload(64)
+
+    assert int(dut.contention_count.value) == 0
+
+
+async def _hpend_monitor(dut, counter, arm):
+    """Count cycles where the host-write collision pending register is set.
+    Silently does nothing under GATES where the hierarchy is absent."""
+    try:
+        regs = dut.user_project.u_regs
+        int(regs.hpend.value)
+    except Exception as exc:
+        dut._log.info("hpend probe unavailable: %s", exc)
+        return
+    dut._log.info("hpend probe attached")
+    stats = counter[1]
+    while True:
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
+        if int(regs.sie_buf_we.value):
+            stats[0] += 1
+        if int(regs.data_wr.value):
+            stats[1] += 1
+            if arm[0]:
+                # pulses never coincide in sim timing; force the collision so
+                # the deferred-write path is exercised (clears next edge)
+                regs.sie_buf_we.value = 1
+                arm[0] = 0
+        if int(regs.hpend.value):
+            counter[0] += 1
+
+
+@cocotb.test()
+async def test_double_buffer(dut):
+    """Two 64-byte buffers: per-buffer host OUT, concurrent host/SIE access,
+    AUTO_SWAP, device RX concurrency, and write-port collision coverage."""
+    await _tb_init(dut)
+    await spi_write(dut, 1, [0x01])
+    await spi_write(dut, 4, [0x0f])
+    await spi_write(dut, 3, [0x0f])
+    await spi_write(dut, 5, [0x00])
+
+    def payload(n, seed=0):
+        return [(seed + i) & 0xFF for i in range(n)]
+
+    async def fill_buffer(hbuf, data):
+        await spi_write(dut, 0x0E, [hbuf])
+        await spi_write(dut, 9, [0])
+        for b in data:
+            await spi_write(dut, 0x0A, [b])
+        await spi_write(dut, 9, [len(data)])
+
+    async def host_out(sbuf, data):
+        async def responder():
+            pkt = await usb_bus.recv_packet(dut)
+            assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x1), f"OUT token {pkt}"
+            pkt = await usb_bus.recv_packet(dut)
+            assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x3), f"DATA {pkt}"
+            assert pkt[1:-2] == data, f"payload sbuf {sbuf}"
+            await ClockCycles(dut.clk, 10)
+            await usb_bus.send_packet(dut, [0x80, usb_bus.pid_byte(0x2)])
+        resp = cocotb.start_soon(responder())
+        await spi_write(dut, 0x0D, [sbuf << 1])
+        await spi_write(dut, 6, [0x10])
+        await resp
+        assert await _wait_done(dut)
+        assert ((await spi_read(dut, 7, 1))[0] & 0x0f) == 0x2
+
+    # host OUT per buffer: A through SBUF=0 then B through SBUF=1
+    a = payload(64, 0x10)
+    b = payload(64, 0x80)
+    await fill_buffer(0, a)
+    await fill_buffer(1, b)
+    await host_out(0, a)
+    await host_out(1, b)
+
+    # host concurrency: 64B OUT of buffer 0 while SPI writes buffer 1
+    await fill_buffer(0, a)
+
+    async def out_and_ack():
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x1)
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[1:-2] == a
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, [0x80, usb_bus.pid_byte(0x2)])
+    resp = cocotb.start_soon(out_and_ack())
+    await spi_write(dut, 0x0D, [0x00])
+    await spi_write(dut, 6, [0x10])
+    new1 = payload(64, 0x40)
+    await spi_write(dut, 0x0E, [1])
+    await spi_write(dut, 9, [0])
+    for bb in new1:
+        await spi_write(dut, 0x0A, [bb])
+    await resp
+    assert await _wait_done(dut)
+    # buffer 1 intact ...
+    await spi_write(dut, 9, [0])
+    assert await spi_read(dut, 0x0A, 64) == new1
+    # ... and buffer 0 sent correctly (verified by responder)
+
+    # AUTO_SWAP: two ACKed host INs land in buffer 0 then buffer 1
+    await spi_write(dut, 0x0D, [0x04])  # SBUF=0, AUTO_SWAP
+    d0 = payload(8, 0x21)
+    d1 = payload(8, 0x55)
+
+    async def in_responder(data):
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x9)
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, usb_bus.data_bytes(0xB, data))
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"no ACK {pkt}"
+
+    resp = cocotb.start_soon(in_responder(d0))
+    await spi_write(dut, 6, [0x60])
+    await resp
+    assert await _wait_done(dut)
+    assert ((await spi_read(dut, 0x0D, 1))[0] & 0x02) == 0x02, "SBUF did not swap"
+
+    resp = cocotb.start_soon(in_responder(d1))
+    await spi_write(dut, 6, [0x60])
+    await resp
+    assert await _wait_done(dut)
+    assert ((await spi_read(dut, 0x0D, 1))[0] & 0x02) == 0x00, "SBUF did not swap back"
+
+    # a NAKed IN must not toggle SBUF
+    async def nak_responder():
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x9)
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, [0x80, usb_bus.pid_byte(0xA)])
+    resp = cocotb.start_soon(nak_responder())
+    await spi_write(dut, 6, [0x60])
+    await resp
+    assert await _wait_done(dut)
+    assert ((await spi_read(dut, 0x0D, 1))[0] & 0x02) == 0x00, "SBUF swapped on NAK"
+
+    # read both buffers back through HBUF
+    await spi_write(dut, 0x0E, [0])
+    assert (await spi_read(dut, 9, 1))[0] == 8
+    assert await spi_read(dut, 0x0A, 8) == d0
+    await spi_write(dut, 0x0E, [1])
+    assert (await spi_read(dut, 9, 1))[0] == 8
+    assert await spi_read(dut, 0x0A, 8) == d1
+
+    # device concurrency: OUT into buffer 0 while SPI writes buffer 1
+    await spi_write(dut, 0x0D, [0x00])
+    await spi_write(dut, 1, [0x02])      # device
+    await spi_write(dut, 6, [0x10])      # arm RX ep0
+
+    collisions = [0, [0, 0]]
+    arm = [0]
+    mon = cocotb.start_soon(_hpend_monitor(dut, collisions, arm))
+    dev = payload(64, 0x30)
+
+    async def write_buf1():
+        await spi_write(dut, 0x0E, [1])
+        await spi_write(dut, 9, [0])
+        for bb in payload(64, 0x60):
+            await spi_write(dut, 0x0A, [bb])
+    writer = cocotb.start_soon(write_buf1())
+    await usb_bus.send_packet(dut, usb_bus.token_bytes(0x1, 0, 0))
+    await ClockCycles(dut.clk, 6)
+    await usb_bus.send_packet(dut, usb_bus.data_bytes(0x3, dev))
+    pkt = await usb_bus.recv_packet(dut)
+    assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"no ACK {pkt}"
+    await writer
+    assert await _wait_done(dut)
+
+    await spi_write(dut, 0x0E, [0])
+    assert (await spi_read(dut, 9, 1))[0] == 64
+    assert await spi_read(dut, 0x0A, 64) == dev
+    await spi_write(dut, 0x0E, [1])
+    await spi_write(dut, 9, [0])
+    assert await spi_read(dut, 0x0A, 64) == payload(64, 0x60)
+
+    # directed collision sweep if concurrent writes never hit the pending
+    # reg: keep firing 64-byte OUTs while bursting DATA writes, offset stepped
+    if collisions[0] == 0:
+        for off in range(0, 30, 7):
+            await spi_write(dut, 6, [0x10])
+            await usb_bus.send_packet(dut, usb_bus.token_bytes(0x1, 0, 0))
+            await ClockCycles(dut.clk, 6 + off)
+
+            async def burst():
+                await spi_write(dut, 0x0A, [0x5A] * 48)
+            arm[0] = 1
+            pk = cocotb.start_soon(burst())
+            await usb_bus.send_packet(dut, usb_bus.data_bytes(0x3, payload(64, off)))
+            pkt = await usb_bus.recv_packet(dut)
+            assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"sweep ACK {pkt}"
+            pk.cancel()
+            await _wait_done(dut)
+            if collisions[0]:
+                break
+    mon.cancel()
+    dut._log.info("host-write collisions deferred: %d (sie_we=%d data_wr=%d)",
+                  collisions[0], collisions[1][0], collisions[1][1])
+
+    assert int(dut.contention_count.value) == 0
+
+
+@cocotb.test()
+async def test_iso(dut):
+    """Isochronous transfers: host iso OUT/IN and device iso OUT/IN carry no
+    handshake; other endpoints still NAK."""
+    await _tb_init(dut)
+    await spi_write(dut, 1, [0x01])
+    await spi_write(dut, 4, [0x0f])
+    await spi_write(dut, 3, [0x0f])
+    await spi_write(dut, 5, [0x00])
+
+    data = [0x10 + i for i in range(8)]
+    await spi_write(dut, 9, [0])
+    for b in data:
+        await spi_write(dut, 0x0A, [b])
+    await spi_write(dut, 9, [8])
+    await spi_write(dut, 0x0D, [0x08])  # ISO
+
+    # ---- host iso OUT: completes after DATA tx, no handshake ----
+    async def watch_out():
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x1)
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[1:-2] == data
+        none = await usb_bus.recv_packet(dut, limit_cycles=60)
+        assert none is None, f"unexpected handshake {none}"
+    w = cocotb.start_soon(watch_out())
+    await spi_write(dut, 6, [0x10])
+    await w
+    assert await _wait_done(dut, polls=100)
+    assert (await spi_read(dut, 7, 1))[0] == 0x00, "iso OUT RESULT"
+
+    # ---- host iso IN: data stored, no ACK ----
+    async def in_resp():
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x9)
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, usb_bus.data_bytes(0xB, data))
+        none = await usb_bus.recv_packet(dut, limit_cycles=60)
+        assert none is None, f"unexpected ACK {none}"
+    w = cocotb.start_soon(in_resp())
+    await spi_write(dut, 6, [0x60])
+    await w
+    assert await _wait_done(dut)
+    assert (await spi_read(dut, 9, 1))[0] == 8
+    assert await spi_read(dut, 0x0A, 8) == data
+
+    # ---- device iso OUT on armed EP1: done, correct data, no ACK ----
+    await spi_write(dut, 1, [0x02])
+    await spi_write(dut, 6, [0x11])      # arm RX EP1
+    await usb_bus.send_packet(dut, usb_bus.token_bytes(0x1, 0, 1))
+    await ClockCycles(dut.clk, 6)
+    await usb_bus.send_packet(dut, usb_bus.data_bytes(0x3, data))
+    none = await usb_bus.recv_packet(dut, limit_cycles=60)
+    assert none is None, f"iso OUT got handshake {none}"
+    assert await _wait_done(dut)
+    assert ((await spi_read(dut, 7, 1))[0] & 0x0f) == 0x1
+    assert (await spi_read(dut, 9, 1))[0] == 8
+    assert await spi_read(dut, 0x0A, 8) == data
+
+    # ---- device iso IN on armed EP1: data sent, done without ACK ----
+    d2 = [0xa0 + i for i in range(8)]
+    await spi_write(dut, 9, [0])
+    for b in d2:
+        await spi_write(dut, 0x0A, [b])
+    await spi_write(dut, 9, [8])
+    await spi_write(dut, 6, [0x61])      # arm TX EP1, DATA1
+    await usb_bus.send_packet(dut, usb_bus.token_bytes(0x9, 0, 1))
+    pkt = await usb_bus.recv_packet(dut)
+    assert pkt is not None and pkt[0] == usb_bus.pid_byte(0xB), f"no iso DATA {pkt}"
+    assert pkt[1:-2] == d2
+    assert await _wait_done(dut)
+    assert ((await spi_read(dut, 7, 1))[0] & 0x0f) == 0x9
+
+    # ---- other endpoints: IN to EP0 still NAKs ----
+    await usb_bus.send_packet(dut, usb_bus.token_bytes(0x9, 0, 0))
+    pkt = await usb_bus.recv_packet(dut)
+    assert pkt is not None and pkt[0] == usb_bus.pid_byte(0xA), f"expected NAK {pkt}"
 
     assert int(dut.contention_count.value) == 0

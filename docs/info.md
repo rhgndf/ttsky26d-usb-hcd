@@ -14,12 +14,11 @@ generation and checking, token/handshake generation, turnaround timeouts,
 1 ms SOF generation, address/endpoint matching and attach/reset detection.
 Software does everything else (enumeration, data toggles, NAK retries,
 scheduling). The packet buffer is built in tnt's (smunaut's) `rf_top`
-register-file macro (as used by femtorv-soc, Apache-2.0), 32 words x 16 bits
-= 64 bytes. USB PHY: ultraembedded `core_usb_fs_phy` (LGPL-2.1,
-github.com/ultraembedded/core_usb_fs_phy @ 68a63ff937e58e90f4f534b9c6705c649d545136). There is one 64-byte packet buffer, so all endpoints must use
-`wMaxPacketSize` <= 64 (the full-speed maximum, so any FS endpoint works;
-a larger device endpoint must be avoided or the transfer fails with
-`OVERFLOW`).
+register-file macro (as used by femtorv-soc, Apache-2.0), 32 words x 32 bits
+= 128 bytes arranged as two independent 64-byte buffers. USB PHY:
+ultraembedded `core_usb_fs_phy` (LGPL-2.1,
+github.com/ultraembedded/core_usb_fs_phy @ 68a63ff937e58e90f4f534b9c6705c649d545136). Each buffer supports
+`wMaxPacketSize` <= 64; larger packets overflow.
 
 The clock must be **48 MHz** (4 samples per USB bit, 0.25 % accuracy).
 
@@ -56,7 +55,7 @@ Unlisted registers read 0. Reset value of every register is 0 unless noted.
 | 0x6 | `CMD` | RW | [3:0] `EP` · [5:4] `OP` · [6] `DATA1` · [7] `ANY` — writing starts an operation, see below |
 | 0x7 | `RESULT` | R | [3:0] `PID` · [6:4] `ERR` · [7] `RX_DATA1` |
 | 0x8 | `TOKEN` | R | device: last token addressed to us: [3:0] EP · [7:4] PID |
-| 0x9 | `LEN` | RW | [6:0] packet length 0-64 (values > 64 are undefined). Writing resets the buffer pointer to 0 |
+| 0x9 | `LEN` | RW | [6:0] packet length 0-64 for `HBUF` (values >64 undefined). Writing resets the host pointer to 0 |
 | 0xA | `DATA` | RW | packet buffer port: accesses `buf[ptr]`, then `ptr = (ptr+1) mod 64`. Non-incrementing in bursts |
 | 0xB | `FRAME_L` | R | frame number [7:0]: host: last SOF sent; device: last SOF received |
 | 0xC | `FRAME_H` | R | [2:0] frame number [10:8] |
