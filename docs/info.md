@@ -15,7 +15,8 @@ generation and checking, token/handshake generation, turnaround timeouts,
 Software does everything else (enumeration, data toggles, NAK retries,
 scheduling). The packet buffer is built in tnt's (smunaut's) `rf_top`
 register-file macro (as used by femtorv-soc, Apache-2.0), 32 words x 16 bits
-= 64 bytes. There is one 64-byte packet buffer, so all endpoints must use
+= 64 bytes. USB PHY: ultraembedded `core_usb_fs_phy` (LGPL-2.1,
+github.com/ultraembedded/core_usb_fs_phy @ 68a63ff937e58e90f4f534b9c6705c649d545136). There is one 64-byte packet buffer, so all endpoints must use
 `wMaxPacketSize` <= 64 (the full-speed maximum, so any FS endpoint works;
 a larger device endpoint must be avoided or the transfer fails with
 `OVERFLOW`).

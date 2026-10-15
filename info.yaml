@@ -23,6 +23,7 @@ project:
     - "spi_slave.v"
     - "i2c_slave.v"
     - "rf_top.v"
+    - "usb_fs_phy.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).

@@ -1,8 +1,10 @@
 /*
- * usb_sie.v - streaming USB full-speed PHY and host/device SIE.
+ * usb_sie.v - streaming USB full-speed host/device SIE.
+ * Bit-level PHY (SYNC, NRZI, bit stuffing, EOP) is handled by the vendored
+ * ultraembedded core_usb_fs_phy UTMI core; this module keeps the byte
+ * layer: packet framing, serial CRC5/CRC16, token decode, transaction FSM.
  * No packet storage: RX bytes stream straight into the register buffer,
- * TX bytes stream out of it. One shared shift/crc/ones datapath for
- * half-duplex RX and TX. All line I/O synchronous to the 48 MHz clk.
+ * TX bytes stream out of it. All line I/O synchronous to the 48 MHz clk.
  * SPDX-License-Identifier: Apache-2.0
  */
 `default_nettype none
@@ -44,23 +46,60 @@ module usb_sie (
     output wire        tx_active
 );
 
-    // TX engine states
-    localparam TX_IDLE=2'd0, TX_BITS=2'd1, TX_EOP0=2'd2, TX_EOPJ=2'd3;
-    // Transaction FSM states
-    localparam S_IDLE=3'd0, S_WAIT=3'd1, S_DEVACK=3'd2, S_DEVDATA=3'd3;
     // TX job kinds
     localparam TK_HS=2'd0, TK_TOKEN=2'd1, TK_DATA=2'd2;
+    // Transaction FSM states
+    localparam S_IDLE=3'd0, S_WAIT=3'd1, S_DEVACK=3'd2, S_DEVDATA=3'd3;
 
-    // ---- PHY ----
+    // ---- vendored UTMI PHY (core_usb_fs_phy) ----
+    wire [7:0] utmi_data_in;
+    wire       utmi_txready, utmi_rxvalid, utmi_rxactive, utmi_rxerror;
+    wire [1:0] utmi_linestate;
+    wire       phy_tx_dp, phy_tx_dm, phy_tx_oen;
+    reg  [7:0] txd;          // utmi_data_out_i
+    reg        txv;          // utmi_txvalid_i
+
+    usb_fs_phy u_phy (
+        .clk_i              (clk),
+        .rst_i              (~rst_n),
+        .utmi_data_out_i    (txd),
+        .utmi_txvalid_i     (txv),
+        .utmi_op_mode_i     (2'b00),
+        .utmi_xcvrselect_i  (2'b01),
+        .utmi_termselect_i  (1'b0),
+        .utmi_dppulldown_i  (1'b0),
+        .utmi_dmpulldown_i  (1'b0),
+        // no differential receiver: rcv = J detector like usb_transceiver.v
+        .usb_rx_rcv_i       (dp_in & ~dm_in),
+        .usb_rx_dp_i        (dp_in),
+        .usb_rx_dn_i        (dm_in),
+        .usb_reset_assert_i (ctrl[3]),        // FORCE_SE0 -> STATE_TX_RST
+        .utmi_data_in_o     (utmi_data_in),
+        .utmi_txready_o     (utmi_txready),
+        .utmi_rxvalid_o     (utmi_rxvalid),
+        .utmi_rxactive_o    (utmi_rxactive),
+        .utmi_rxerror_o     (utmi_rxerror),
+        .utmi_linestate_o   (utmi_linestate),
+        .usb_tx_dp_o        (phy_tx_dp),
+        .usb_tx_dn_o        (phy_tx_dm),
+        .usb_tx_oen_o       (phy_tx_oen),
+        .usb_reset_detect_o (),
+        .usb_en_o           ()
+    );
+
+    wire phy_oe = ~phy_tx_oen;
+    // blank our receiver while we transmit or while FORCE_K is asserted
+    wire rx_blank  = phy_oe | ctrl[4];
+    wire rxact     = utmi_rxactive & ~rx_blank;
+    wire rxv       = utmi_rxvalid & ~rx_blank;
+
+    assign tx_oe = phy_oe | ctrl[3] | ctrl[4];
+    assign tx_dp = ctrl[3] ? 1'b0 : ctrl[4] ? 1'b0 : phy_tx_dp;
+    assign tx_dm = ctrl[3] ? 1'b0 : ctrl[4] ? 1'b1 : phy_tx_dm;
+    assign tx_active = phy_oe & ~ctrl[3];
+
+    // ---- our own line state for STATUS/IRQ.LINE (unchanged semantics) ----
     reg [1:0] dp_s, dm_s;
-    reg [1:0] rx_phase;
-    reg rx_line_dp, rx_line_dm;
-    reg rx_last_dp, rx_last_dm;
-    reg rx_active, rx_eop;
-    reg [2:0] rx_eop_se0;
-    reg rx_bits_en;
-    reg rx_bad_stuff;
-    reg rx_packet_done;
     reg [7:0] se0_count;
     reg [7:0] line_idle_count;
     reg line_sample_dp, line_sample_dm;
@@ -68,28 +107,30 @@ module usb_sie (
     reg old_se0_long;
 
     // ---- shared RX/TX datapath ----
-    reg [7:0] shift;
-    reg [2:0] bitcnt;
-    reg [2:0] ones;
     reg [15:0] crc;
-    reg [6:0] rxcnt;         // bytes completed this packet (0=SYNC,1=PID,..)
-    reg [3:0] rx_pid;
-    reg       rx_pid_ok;
-    reg [7:0] tok_lo;        // first byte after PID
-    reg       rx_accept;
+    reg [10:0] cf;           // serial CRC feed shift register (LSB first)
+    reg [3:0]  cfcnt;        // bits left to feed
+    reg        cf5;          // feed mode: 1 = crc5, 0 = crc16
+    reg [6:0]  rxcnt;        // rxvalid bytes this packet (0=PID not yet,1=PID,2..=body)
+    reg [3:0]  rx_pid;
+    reg        rx_pid_ok;
+    reg [7:0]  rx_byte;      // last received byte
+    reg [7:0]  tok_lo;       // first byte after PID
+    reg        rx_accept;
+    reg        rx_err;       // utmi_rxerror seen during packet
+    reg        rxact_d;
+    reg        pend_eval;    // EOP seen, waiting for CRC feed to drain
+    reg        rx_packet_done;
 
-    // ---- TX engine ----
-    reg [1:0] tx_state;
-    reg [1:0] tx_phase;
-    reg [9:0] tx_bit_index;
-    reg [6:0] tx_len;        // body bytes (data pkts); unused for token/hs
-    reg [1:0] tx_crc_mode;   // 0 none, 1 crc16, 2 crc5
-    reg tx_stuff;
-    reg tx_line_dp, tx_line_dm;
-    reg tx_done;
-    reg [3:0] tx_pid;
+    // ---- TX byte sequencer ----
+    reg        tx_ours;      // a tx_job-issued packet is in flight
+    reg        phy_oe_d;
+    reg        tx_done;
+    reg [3:0]  tx_pid;
     reg [10:0] tx_tok;
-    reg tx_emit;
+    reg [1:0]  tx_kind;
+    reg [7:0]  tx_rem;       // bytes remaining after the PID byte
+    reg [1:0]  tx_crc_mode;  // 0 none, 1 crc16, 2 crc5
 
     // ---- transaction FSM ----
     reg [2:0] tstate;
@@ -98,25 +139,13 @@ module usb_sie (
     reg [3:0] tok_pid;       // device: PID of the token that opened this op
     // host uses cmd_op/cmd_ep/cmd_data1 live: regs freeze them while busy
     reg [15:0] sof_timer;
-    reg       sof_pending;
-
-    assign tx_active = (tx_state != TX_IDLE);
-    assign tx_oe = tx_active | ctrl[3] | ctrl[4];
-    assign tx_dp = ctrl[3] ? 1'b0 : ctrl[4] ? 1'b0 : tx_line_dp;
-    assign tx_dm = ctrl[3] ? 1'b0 : ctrl[4] ? 1'b1 : tx_line_dm;
+    reg        sof_pending;
 
     wire rx_se0 = (dp_s[1] == 0 && dm_s[1] == 0);
-    wire rx_bit  = (dp_s[1] == rx_last_dp && dm_s[1] == rx_last_dm); // 1 = no NRZI change
-    wire [7:0] rx_newbyte = {rx_bit, shift[7:1]};
     wire       rx_crc5 = (rx_pid[1:0] == 2'b01);
-    wire [3:0] tok_ep  = {shift[2:0], tok_lo[0]}; // last token byte sits in shift at EOP
+    wire [3:0] tok_ep  = {rx_byte[2:0], tok_lo[0]}; // last token byte in rx_byte
     assign tok_val = {rx_pid, tok_ep};
-    assign len_val = rxcnt - 4;
-
-    // TX emit boundaries derived from mode/len
-    wire [9:0] tx_body_end = (tx_crc_mode == 2) ? 10'd27 : 10'd16 + {tx_len, 3'b0};
-    wire [9:0] tx_end      = (tx_crc_mode == 0) ? 10'd16 :
-                             (tx_crc_mode == 2) ? 10'd32 : 10'd32 + {tx_len, 3'b0};
+    assign len_val = rxcnt - 3;
 
     // Queue a packet for transmission.
     task tx_job;
@@ -125,28 +154,29 @@ module usb_sie (
         input [10:0] tok;
         input [6:0] dlen;
         begin
+            tx_kind <= kind;
             tx_pid <= pid;
             tx_tok <= tok;
+            txd <= {~pid, pid};
+            txv <= 1;
+            tx_ours <= 1;
             tx_done <= 0;
-            tx_bit_index <= 0;
-            tx_phase <= 0;
-            ones <= 0;
-            tx_stuff <= 0;
-            tx_line_dp <= 1;
-            tx_line_dm <= 0;
-            tx_len <= dlen;
             crc <= 16'hffff;
             case (kind)
-                TK_HS:    tx_crc_mode <= 0;
-                TK_TOKEN: tx_crc_mode <= 2;
-                default: begin
-                    tx_crc_mode <= 1;
-                    bufptr_clr <= 1;
-                end
+                TK_HS:    begin tx_crc_mode <= 0; tx_rem <= 0;            end
+                TK_TOKEN: begin tx_crc_mode <= 2; tx_rem <= 8'd2;         end
+                default:  begin tx_crc_mode <= 1; tx_rem <= {1'b0, dlen} + 8'd2;
+                                bufptr_clr <= 1;                          end
             endcase
-            tx_state <= TX_BITS;
         end
     endtask
+
+    // next TX byte after the one just accepted (tx_rem is pre-decrement count)
+    wire [7:0] tx_next =
+        (tx_kind == TK_TOKEN) ? ((tx_rem == 8'd2) ? tx_tok[7:0]
+                                                 : {~crc[4:0], tx_tok[10:8]}) :
+        /* TK_DATA */         ((tx_rem > 8'd2)   ? buf_rdata :
+                              (tx_rem == 8'd2)   ? ~crc[7:0] : ~crc[15:8]);
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -154,17 +184,6 @@ module usb_sie (
             dm_s <= 2'b00;
             dp_sync <= 1;
             dm_sync <= 0;
-            rx_phase <= 0;
-            rx_line_dp <= 1;
-            rx_line_dm <= 0;
-            rx_last_dp <= 1;
-            rx_last_dm <= 0;
-            rx_active <= 0;
-            rx_eop <= 0;
-            rx_eop_se0 <= 0;
-            rx_bits_en <= 0;
-            rx_bad_stuff <= 0;
-            rx_packet_done <= 0;
             se0_count <= 0;
             line_idle_count <= 0;
             line_sample_dp <= 1;
@@ -173,26 +192,30 @@ module usb_sie (
             line_reported_dm <= 0;
             se0_long <= 0;
             old_se0_long <= 0;
-            shift <= 0;
-            bitcnt <= 0;
-            ones <= 0;
             crc <= 0;
+            cf <= 0;
+            cfcnt <= 0;
+            cf5 <= 0;
             rxcnt <= 0;
             rx_pid <= 0;
             rx_pid_ok <= 0;
+            rx_byte <= 0;
             tok_lo <= 0;
             rx_accept <= 0;
-            tx_state <= TX_IDLE;
-            tx_phase <= 0;
-            tx_bit_index <= 0;
-            tx_len <= 0;
-            tx_crc_mode <= 0;
-            tx_stuff <= 0;
-            tx_line_dp <= 1;
-            tx_line_dm <= 0;
-            tx_done <= 0;
+            rx_err <= 0;
+            rxact_d <= 0;
+            pend_eval <= 0;
+            rx_packet_done <= 0;
+            tx_ours <= 0;
+            phy_oe_d <= 0;
+            txv <= 0;
+            txd <= 0;
             tx_pid <= 0;
             tx_tok <= 0;
+            tx_kind <= 0;
+            tx_rem <= 0;
+            tx_crc_mode <= 0;
+            tx_done <= 0;
             tstate <= S_IDLE;
             tim <= 0;
             pend_hs <= 0;
@@ -207,11 +230,8 @@ module usb_sie (
             op_done <= 0;
             res_wr <= 0;
             res_val <= 0;
-
             tok_wr <= 0;
-
             len_wr <= 0;
-
             irq_set <= 0;
         end else begin
             dp_s <= {dp_s[0], dp_in};
@@ -247,7 +267,7 @@ module usb_sie (
                     line_reported_dm <= 0;
                 end
             end
-            if (tx_oe || rx_active || rx_se0) begin
+            if (tx_oe || rxact || rx_se0) begin
                 line_idle_count <= 0;
             end else if (dp_s[1] != line_sample_dp || dm_s[1] != line_sample_dm) begin
                 line_sample_dp <= dp_s[1];
@@ -275,110 +295,95 @@ module usb_sie (
                 sof_pending <= 0;
             end
 
-            // ---------------- RX bit engine ----------------
-            if (tx_oe) begin
-                rx_active <= 0;
-                rx_phase <= 0;
-                rx_line_dp <= dp_s[1];
-                rx_line_dm <= dm_s[1];
-                rx_last_dp <= dp_s[1];
-                rx_last_dm <= dm_s[1];
-            end else begin
-                if (dp_s[1] != rx_line_dp || dm_s[1] != rx_line_dm) begin
-                    rx_phase <= 0;
-                    if (dp_s[1] != dm_s[1])
-                        rx_bits_en <= 1;
-                end else
-                    rx_phase <= rx_phase + 1;
-                rx_line_dp <= dp_s[1];
-                rx_line_dm <= dm_s[1];
+            // ---------------- serial CRC feed ----------------
+            if (cfcnt != 0) begin
+                if (cf5)
+                    crc[4:0] <= {1'b0, crc[4:1]} ^ ((crc[0] ^ cf[0]) ? 5'h14 : 5'h0);
+                else
+                    crc <= {1'b0, crc[15:1]} ^ ((crc[0] ^ cf[0]) ? 16'ha001 : 16'h0);
+                cf <= {1'b0, cf[10:1]};
+                cfcnt <= cfcnt - 1;
+            end
 
-                if (rx_phase == 1) begin
-                    if (rx_se0) begin
-                        if (rx_active) begin
-                            rx_eop <= 1;
-                            if (rx_eop_se0 != 7)
-                                rx_eop_se0 <= rx_eop_se0 + 1;
-                        end
-                    end else if (rx_eop) begin
-                        if (dp_s[1] && !dm_s[1]) begin
-                            rx_active <= 0;
-                            rx_eop <= 0;
-                            rx_eop_se0 <= 0;
-                            rx_packet_done <= 1;
-                        end
-                    end else if (!rx_active) begin
-                        if (rx_last_dp && !rx_last_dm && !dp_s[1] && dm_s[1]) begin
-                            rx_active <= 1;
-                            crc <= 16'hffff;
-                            rxcnt <= 0;
-                            bitcnt <= 1;
-                            shift <= 0;
-                            rx_last_dp <= dp_s[1];
-                            rx_last_dm <= dm_s[1];
-                            ones <= 0;
-                            rx_bad_stuff <= 0;
-                            rx_bits_en <= 0;
-                        end
-                    end else if (rx_bits_en) begin
-                        if (rx_bit) begin
-                            if (ones == 6) begin
-                                rx_bad_stuff <= 1; // 1 after six 1s: stuff error
-                                ones <= 0;
-                            end else begin
-                                shift <= rx_newbyte;
-                                bitcnt <= bitcnt + 1;
-                                ones <= ones + 1;
-                            end
-                        end else begin
-                            if (ones == 6) begin
-                                ones <= 0; // stuffed zero dropped
-                            end else begin
-                                shift <= rx_newbyte;
-                                bitcnt <= bitcnt + 1;
-                                ones <= 0;
-                            end
-                        end
-                        // serial CRC over every unstuffed bit after the PID byte
-                        if (rxcnt >= 2 && !(ones == 6 && !rx_bit)) begin
-                            if (rx_crc5)
-                                crc[4:0] <= {1'b0, crc[4:1]} ^ ((crc[0] ^ rx_bit) ? 5'h14 : 5'h0);
-                            else
-                                crc <= {1'b0, crc[15:1]} ^ ((crc[0] ^ rx_bit) ? 16'ha001 : 16'h0);
-                        end
-                        // byte completion
-                        if (bitcnt == 7 && !(ones == 6 && !rx_bit)) begin
-                            bitcnt <= 0;
-                            if (rxcnt != 127)
-                                rxcnt <= rxcnt + 1;
-                            if (rxcnt == 1) begin
-                                rx_pid <= rx_newbyte[3:0];
-                                rx_pid_ok <= (rx_newbyte[7:4] == ~rx_newbyte[3:0]);
-                            end else begin
-                                if (rxcnt == 2)
-                                    tok_lo <= rx_newbyte;
-                                if (rxcnt >= 2 && rxcnt < 66 && rx_accept) begin
-                                    buf_we <= 1;
-                                    buf_wdata <= rx_newbyte;
-                                end
-                            end
-                        end
+            // ---------------- UTMI RX byte layer ----------------
+            rxact_d <= rxact;
+            phy_oe_d <= phy_oe;
+            if (rxact && !rxact_d) begin
+                // start of packet (first byte after SYNC)
+                rxcnt <= 0;
+                crc <= 16'hffff;
+                cfcnt <= 0;
+                rx_err <= 0;
+                rx_pid_ok <= 0;
+            end
+            if (rxact && utmi_rxerror)
+                rx_err <= 1;
+            if (rxv) begin
+                rx_byte <= utmi_data_in;
+                if (rxcnt == 0) begin
+                    // PID byte
+                    rx_pid <= utmi_data_in[3:0];
+                    rx_pid_ok <= (utmi_data_in[7:4] == ~utmi_data_in[3:0]);
+                    rxcnt <= 1;
+                end else begin
+                    if (rxcnt != 127)
+                        rxcnt <= rxcnt + 1;
+                    if (rxcnt == 1)
+                        tok_lo <= utmi_data_in;
+                    if (rxcnt >= 1 && rxcnt < 65 && rx_accept) begin
+                        buf_we <= 1;
+                        buf_wdata <= utmi_data_in;
                     end
-                    if (!rx_se0) begin
-                        rx_last_dp <= dp_s[1];
-                        rx_last_dm <= dm_s[1];
+                    // CRC covers every byte after the PID
+                    cf <= {3'b0, utmi_data_in};
+                    cfcnt <= 8;
+                    cf5 <= rx_crc5;
+                end
+            end
+            // end of packet: rxactive falls; evaluate once the CRC feed has
+            // drained (the last byte's bits finish a few clocks later)
+            if (rxact_d && !rxact)
+                pend_eval <= 1;
+            if (pend_eval && cfcnt == 0 && !rxv) begin
+                pend_eval <= 0;
+                rx_packet_done <= 1;
+            end
+
+            // ---------------- UTMI TX byte layer ----------------
+            // tx_done when the PHY finishes driving (our packets only)
+            if (phy_oe_d && !phy_oe && tx_ours) begin
+                tx_done <= 1;
+                tx_ours <= 0;
+            end
+            if (txv && utmi_txready) begin
+                if (tx_rem == 0) begin
+                    txv <= 0;
+                end else begin
+                    tx_rem <= tx_rem - 1;
+                    txd <= tx_next;
+                    // feed body bits into the CRC
+                    if (tx_crc_mode == 2 && tx_rem == 8'd2) begin
+                        cf <= tx_tok;
+                        cfcnt <= 11;
+                        cf5 <= 1;
+                    end else if (tx_crc_mode == 1 && tx_rem > 8'd2) begin
+                        cf <= {3'b0, buf_rdata};
+                        cfcnt <= 8;
+                        cf5 <= 0;
                     end
+                    if (tx_crc_mode == 1 && tx_rem > 8'd2)
+                        buf_inc <= 1;
                 end
             end
 
             // ---------------- packet interpretation at EOP ----------------
-            // Tokens: rxcnt==4, data byte count = rxcnt-4.
-            if (rx_packet_done && rxcnt >= 2 && rx_pid_ok && !rx_bad_stuff) begin
+            // Tokens end with rxcnt==3 (PID + 2 bytes); data length = rxcnt-3.
+            if (rx_packet_done && rxcnt >= 1 && rx_pid_ok && !rx_err) begin
                 if (!ctrl[0]) begin
                     // ---------- device ----------
-                    if (rx_pid[1:0] == 2'b01 && rxcnt == 4 && crc[4:0] == 5'h6) begin
+                    if (rx_pid[1:0] == 2'b01 && rxcnt == 3 && crc[4:0] == 5'h6) begin
                         if (rx_pid == 4'h5) begin
-                            frame <= {shift[2:0], tok_lo};
+                            frame <= {rx_byte[2:0], tok_lo};
                             irq_set[1] <= 1;
                         end else if (tok_lo[7:1] == addr_reg) begin
                             tok_wr <= 1;
@@ -417,7 +422,7 @@ module usb_sie (
                         end
                     end else if ((rx_pid == 4'h3 || rx_pid == 4'hb) && tstate == S_DEVDATA) begin
                         // data phase of OUT/SETUP
-                        if (rxcnt >= 4 && crc == 16'hb001) begin
+                        if (rxcnt >= 3 && crc == 16'hb001) begin
                             rx_accept <= 0;
                             if (pend_hs == 4'h2) begin
                                 len_wr <= 1;
@@ -451,14 +456,14 @@ module usb_sie (
                         res_val <= {1'b0, 4'b0, rx_pid};
                         irq_set[0] <= 1;
                     end else if (tstate == S_WAIT && (rx_pid == 4'h3 || rx_pid == 4'hb)) begin
-                        if (rxcnt > 68) begin
+                        if (rxcnt > 67) begin
                             busy <= 0;
                             tstate <= S_IDLE;
                             op_done <= 1;
                             res_wr <= 1;
                             res_val <= {1'b0, 3'd3, rx_pid};
                             irq_set[0] <= 1;
-                        end else if (rxcnt >= 4 && crc == 16'hb001) begin
+                        end else if (rxcnt >= 3 && crc == 16'hb001) begin
                             len_wr <= 1;
                             rx_accept <= 0;
                             tx_job(TK_HS, 4'h2, 11'b0, 4'b0);
@@ -483,10 +488,10 @@ module usb_sie (
             // ---------------- transaction FSM ----------------
             case (tstate)
                 S_IDLE: begin
-                    if (ctrl[0] && !busy && sof_pending && tx_state == TX_IDLE) begin
+                    if (ctrl[0] && !busy && sof_pending && !phy_oe && !txv) begin
                         tx_job(TK_TOKEN, 4'h5, frame, 4'b0);
                         sof_pending <= 0;
-                    end else if (ctrl[0] && cmd_wr && cmd_op != 3 && tx_state == TX_IDLE &&
+                    end else if (ctrl[0] && cmd_wr && cmd_op != 3 && !phy_oe && !txv &&
                                  (!ctrl[2] || sof_timer < 16'd46976) && !sof_pending && !busy) begin
                         busy <= 1;
                         tx_job(TK_TOKEN, cmd_op == 2 ? 4'h9 : (cmd_op == 0 ? 4'hd : 4'h1),
@@ -510,7 +515,7 @@ module usb_sie (
                         irq_set[1] <= 1;
                 end
                 S_WAIT, S_DEVACK: begin
-                    if (rx_active || tx_state != TX_IDLE) begin
+                    if (rxact || phy_oe || txv) begin
                         tim <= 0; // own transmit still in flight
                     end else if (tim == 79) begin
                         tstate <= S_IDLE;
@@ -526,7 +531,7 @@ module usb_sie (
                     end else tim <= tim + 1;
                 end
                 S_DEVDATA: begin
-                    if (rx_active)
+                    if (rxact)
                         tim <= 0;
                     else if (tim == 79) begin
                         // no data packet followed the token
@@ -536,93 +541,9 @@ module usb_sie (
                 end
                 default: tstate <= S_IDLE;
             endcase
-
-            // ---------------- TX bit engine ----------------
-            case (tx_state)
-                TX_IDLE: begin
-                    tx_phase <= 0;
-                    tx_line_dp <= 1;
-                    tx_line_dm <= 0;
-                end
-                TX_BITS: begin
-                    if (tx_phase == 3) begin
-                        tx_phase <= 0;
-                        if (tx_stuff) begin
-                            tx_stuff <= 0;
-                            ones <= 0;
-                            tx_line_dp <= ~tx_line_dp;
-                            tx_line_dm <= ~tx_line_dm;
-                        end else if (tx_bit_index >= tx_end) begin
-                            tx_state <= TX_EOP0;
-                            tx_line_dp <= 0;
-                            tx_line_dm <= 0;
-                        end else begin
-                            if (tx_bit_index < 8)
-                                tx_emit = tx_bit_index == 7;
-                            else if (tx_bit_index < 16)
-                                tx_emit = (tx_bit_index[2:0] < 4) ?
-                                          tx_pid[tx_bit_index[2:0]] :
-                                          ~tx_pid[tx_bit_index[1:0]];
-                            else if (tx_bit_index < tx_body_end) begin
-                                if (tx_crc_mode == 2) begin
-                                    tx_emit = tx_tok[tx_bit_index - 16];
-                                    crc[4:0] <= {1'b0, crc[4:1]} ^
-                                                ((crc[0] ^ tx_tok[tx_bit_index - 16]) ? 5'h14 : 5'h0);
-                                end else begin
-                                    tx_emit = buf_rdata[tx_bit_index[2:0]];
-                                    crc <= {1'b0, crc[15:1]} ^
-                                           ((crc[0] ^ buf_rdata[tx_bit_index[2:0]]) ? 16'ha001 : 16'h0);
-                                end
-                            end else begin
-                                tx_emit = ~crc[0];
-                                if (tx_crc_mode == 2)
-                                    crc[4:0] <= {1'b0, crc[4:1]};
-                                else
-                                    crc <= {1'b0, crc[15:1]};
-                            end
-                            tx_bit_index <= tx_bit_index + 1;
-                            // buffer pointer advances at each body byte boundary
-                            if (tx_crc_mode == 1 && tx_bit_index >= 16 &&
-                                tx_bit_index < tx_body_end && tx_bit_index[2:0] == 7)
-                                buf_inc <= 1;
-                            if (tx_emit) begin
-                                ones <= ones + 1;
-                                if (ones == 5) tx_stuff <= 1;
-                            end else begin
-                                ones <= 0;
-                                tx_line_dp <= ~tx_line_dp;
-                                tx_line_dm <= ~tx_line_dm;
-                            end
-                        end
-                    end else tx_phase <= tx_phase + 1;
-                end
-                TX_EOP0: begin
-                    tx_line_dp <= 0;
-                    tx_line_dm <= 0;
-                    if (tx_phase == 3) begin
-                        tx_phase <= 0;
-                        if (tx_bit_index == tx_end + 1) begin
-                            tx_state <= TX_EOPJ;
-                            tx_line_dp <= 1;
-                            tx_line_dm <= 0;
-                        end
-                        tx_bit_index <= tx_bit_index + 1;
-                    end else tx_phase <= tx_phase + 1;
-                end
-                TX_EOPJ: begin
-                    tx_line_dp <= 1;
-                    tx_line_dm <= 0;
-                    if (tx_phase == 3) begin
-                        tx_state <= TX_IDLE;
-                        tx_phase <= 0;
-                        tx_done <= 1;
-                    end else tx_phase <= tx_phase + 1;
-                end
-                default: tx_state <= TX_IDLE;
-            endcase
         end
     end
 
-    wire _unused = &{rx_eop_se0, cmd_any, 1'b0};
+    wire _unused = &{cmd_any, utmi_linestate, 1'b0};
 
 endmodule
