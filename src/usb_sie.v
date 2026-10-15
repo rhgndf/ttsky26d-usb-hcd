@@ -517,6 +517,7 @@ module usb_sie (
                             if (iso && cmd_op == 2'b01) begin
                                 // iso OUT: no handshake expected
                                 busy <= 0;
+                                rx_accept <= 0;
                                 op_done <= 1;
                                 res_wr <= 1;
                                 res_val <= 8'h00;
