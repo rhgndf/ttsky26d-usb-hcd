@@ -31,7 +31,7 @@ the role fully software controlled, so one board works as host or device:
 |-----|---------------------------|------------------------------|
 | `uio[2]` PULLUP | Hi-Z | drives 1 when `CTRL.PULLUP=1` (connect), else Hi-Z (disconnect). Wire 1.5 kΩ to D+. |
 | `uio[3]` PULLDOWN_DP | drives 0: enables the D+ 15 kΩ host pull-down | Hi-Z |
-|| `uio[6]` PULLDOWN_DM | drives 0: enables the D- 15 kΩ host pull-down | Hi-Z |
+| `uio[6]` PULLDOWN_DM | drives 0: enables the D- 15 kΩ host pull-down | Hi-Z |
 
 Attach / detach and speed are sensed digitally from the line state
 (`STATUS.DP`, `STATUS.DM`) and the SE0 timer (`STATUS.SE0_LONG`, set when SE0
