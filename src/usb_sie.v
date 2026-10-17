@@ -20,7 +20,8 @@ module usb_sie (
     input  wire [1:0]  cmd_op,
     input  wire        cmd_data1,
     input  wire        cmd_any,
-    input  wire        cmd_wr,
+    input  wire        cmd_pend,
+    output reg         cmd_ack,
     input  wire [6:0]  len_reg,
     input  wire        iso,
     input  wire [7:0]  buf_rdata,
@@ -51,6 +52,8 @@ module usb_sie (
     localparam TK_HS=2'd0, TK_TOKEN=2'd1, TK_DATA=2'd2;
     // Transaction FSM states
     localparam S_IDLE=3'd0, S_WAIT=3'd1, S_DEVACK=3'd2, S_DEVDATA=3'd3;
+    // response timeout in clocks (28 bit times measured to rxactive)
+    localparam [6:0] TIMEOUT = 7'd112;
 
     // ---- vendored UTMI PHY (core_usb_fs_phy) ----
     wire [7:0] utmi_data_in;
@@ -60,9 +63,16 @@ module usb_sie (
     reg  [7:0] txd;          // utmi_data_out_i
     reg        txv;          // utmi_txvalid_i
 
+    // PHY reset: async assert, synchronous release (2-flop)
+    reg [1:0] phy_rs;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) phy_rs <= 2'b00;
+        else        phy_rs <= {phy_rs[0], 1'b1};
+    end
+
     usb_fs_phy u_phy (
         .clk_i              (clk),
-        .rst_i              (~rst_n),
+        .rst_i              (~phy_rs[1]),
         .utmi_data_out_i    (txd),
         .utmi_txvalid_i     (txv),
         .utmi_op_mode_i     (2'b00),
@@ -222,6 +232,7 @@ module usb_sie (
             tim <= 0;
             pend_hs <= 0;
             pend_iso <= 0;
+            cmd_ack <= 0;
             sof_timer <= 0;
             sof_pending <= 0;
             frame <= 0;
@@ -251,6 +262,7 @@ module usb_sie (
             rx_packet_done <= 0;
             buf_we <= 0;
             buf_inc <= 0;
+            cmd_ack <= 0;
 
             // SE0 detect / line-idle irq
             if (rx_se0) begin
@@ -405,7 +417,8 @@ module usb_sie (
                                 end
                             end else if (rx_pid == 4'h1 || rx_pid == 4'hd) begin
                                 if (rx_pid == 4'hd)
-                                    pend_hs <= (cmd_op != 0) ? 4'h2 : 4'ha;
+                                    // SETUP never NAKed: unarmed -> no handshake
+                                    pend_hs <= (cmd_op != 0) ? 4'h2 : 4'h0;
                                 else if (cmd_op == 1 && (cmd_any || tok_ep == cmd_ep))
                                     pend_hs <= 4'h2;
                                 else if (cmd_op == 3 && tok_ep == cmd_ep)
@@ -436,7 +449,7 @@ module usb_sie (
                                 op_done <= 1;
                                 irq_set[0] <= 1;
                             end
-                            if (!pend_iso)
+                            if (!pend_iso && pend_hs != 4'h0)
                                 tx_job(TK_HS, pend_hs, 11'b0, 4'b0);
                             tstate <= S_IDLE;
                         end else begin
@@ -498,9 +511,10 @@ module usb_sie (
                     if (ctrl[0] && !busy && sof_pending && !phy_oe && !txv) begin
                         tx_job(TK_TOKEN, 4'h5, frame, 4'b0);
                         sof_pending <= 0;
-                    end else if (ctrl[0] && cmd_wr && cmd_op != 3 && !phy_oe && !txv &&
-                                 (!ctrl[2] || sof_timer < 16'd46976) && !sof_pending && !busy) begin
+                    end else if (ctrl[0] && cmd_pend && cmd_op != 3 && !phy_oe && !txv &&
+                                 (!ctrl[2] || sof_timer < 16'd44928) && !sof_pending && !busy) begin
                         busy <= 1;
+                        cmd_ack <= 1;
                         tx_job(TK_TOKEN, cmd_op == 2 ? 4'h9 : (cmd_op == 0 ? 4'hd : 4'h1),
                                {addr_reg, cmd_ep}, 4'b0);
                         rx_accept <= 1;
@@ -541,7 +555,7 @@ module usb_sie (
                         tstate <= S_IDLE;
                     end else if (rxact || phy_oe || txv) begin
                         tim <= 0; // own transmit still in flight
-                    end else if (tim == 79) begin
+                    end else if (tim == TIMEOUT-1) begin
                         tstate <= S_IDLE;
                         if (tstate == S_WAIT) begin
                             busy <= 0;
@@ -557,7 +571,7 @@ module usb_sie (
                 S_DEVDATA: begin
                     if (rxact)
                         tim <= 0;
-                    else if (tim == 79) begin
+                    else if (tim == TIMEOUT-1) begin
                         // no data packet followed the token
                         tstate <= S_IDLE;
                         rx_accept <= 0;

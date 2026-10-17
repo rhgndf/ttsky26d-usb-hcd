@@ -30,7 +30,8 @@ the role fully software controlled, so one board works as host or device:
 | Pin | Host mode (`CTRL.HOST=1`) | Device mode (`CTRL.HOST=0`) |
 |-----|---------------------------|------------------------------|
 | `uio[2]` PULLUP | Hi-Z | drives 1 when `CTRL.PULLUP=1` (connect), else Hi-Z (disconnect). Wire 1.5 kΩ to D+. |
-| `uio[3]` PULLDOWN | drives 0: enables the 15 kΩ host pull-downs | Hi-Z: the two 15 kΩ resistors only bridge D+/D- with 30 kΩ (harmless) |
+| `uio[3]` PULLDOWN_DP | drives 0: enables the D+ 15 kΩ host pull-down | Hi-Z |
+|| `uio[6]` PULLDOWN_DM | drives 0: enables the D- 15 kΩ host pull-down | Hi-Z |
 
 Attach / detach and speed are sensed digitally from the line state
 (`STATUS.DP`, `STATUS.DM`) and the SE0 timer (`STATUS.SE0_LONG`, set when SE0
@@ -69,7 +70,7 @@ says which; useful to learn what the host is asking for).
 PIDs: OUT=0x1, IN=0x9, SOF=0x5, SETUP=0xD, DATA0=0x3, DATA1=0xB, ACK=0x2,
 NAK=0xA, STALL=0xE.
 
-`RESULT.ERR`: 0 `OK`, 1 `TIMEOUT` (no response within 20 bit times),
+`RESULT.ERR`: 0 `OK`, 1 `TIMEOUT` (no response started within ~18 bit times),
 2 `BAD` (CRC, bit-stuff, PID-check or framing error), 3 `OVERFLOW` (data
 packet longer than 64 bytes), 4 `UNEXPECTED` (valid packet of the wrong type).
 
@@ -90,8 +91,9 @@ ends, then `IRQ.DONE` is raised. Writes to `CMD` while busy are ignored.
   packets are not ACKed.
 * NAKs are not retried by hardware: re-issue the command.
 * With `CTRL.SOF_EN=1` a SOF with an incrementing 11-bit frame number is sent
-  every 48000 clocks (1 ms). A command issued in the last ~21 µs of a frame
-  waits until after the SOF, so transactions never collide with SOFs.
+  every 48000 clocks (1 ms). A command issued in the last ~64 µs of a frame
+  is queued and runs right after the SOF, so transactions never collide
+  with SOFs.
 * Bus reset: set `CTRL.FORCE_SE0` for 10-20 ms (software-timed), then clear
   it and set `SOF_EN` (SOFs are the keep-alive that prevents suspend).
 
@@ -102,7 +104,7 @@ operation in `CMD.OP` (`EP` is the endpoint it applies to):
 
 | `OP` | SETUP (any EP) | OUT to `EP` (any EP if `ANY`) | IN to `EP` | other OUT / IN |
 |------|----------------|-------------------------------|------------|----------------|
-| 0 `IDLE` | ignored (`NAK` irq) | NAK | NAK | NAK |
+| 0 `IDLE` | no handshake (host retries), `NAK` irq | NAK | NAK | NAK |
 | 1 `RX` | accept, ACK | accept, ACK | NAK | NAK |
 | 2 `TX` | accept, ACK (TX data discarded) | NAK | send `LEN` bytes as DATA0/1 per `CMD.DATA1` | NAK |
 | 3 `STALL` | accept, ACK | STALL | STALL | NAK |
@@ -140,8 +142,8 @@ clock stretching.
 ## How to test
 
 Clock 48 MHz. Connect D+/D- of a USB connector to `uio[0]`/`uio[1]` through
-22-33 Ω series resistors, 1.5 kΩ from `uio[2]` to D+, and 15 kΩ from each of
-D+ and D- to `uio[3]`.
+22-33 Ω series resistors, 1.5 kΩ from `uio[2]` to D+, 15 kΩ from D+ to
+`uio[3]` and 15 kΩ from D- to `uio[6]`.
 
 Device-mode smoke test (over SPI or I2C): write `CTRL=0x02` (device, connect),
 `IRQ_EN=0x07`, `CMD=0x10` (arm RX). Plug into a PC: you will see `IRQ.LINE`

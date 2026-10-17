@@ -39,7 +39,8 @@ module usb_regs (
     output reg  [1:0]  cmd_op,
     output reg         cmd_data1,
     output reg         cmd_any,
-    output reg         cmd_wr,
+    output reg         cmd_pend,
+    input  wire        sie_cmd_ack,
     output wire [6:0]  len_reg,
     output wire        iso,
     output wire [7:0]  buf_rdata,
@@ -154,7 +155,7 @@ module usb_regs (
         case (raddr)
             ADDR_ID:     rdata_r = 8'h5B;
             ADDR_CTRL:   rdata_r = {2'b0, ctrl};
-            ADDR_STATUS: rdata_r = {3'b0, vbus, busy, se0_long, dp_sync, dm_sync};
+            ADDR_STATUS: rdata_r = {3'b0, vbus, busy | cmd_pend, se0_long, dp_sync, dm_sync};
             ADDR_IRQ:    rdata_r = {4'b0, irq};
             ADDR_IRQ_EN: rdata_r = {4'b0, irq_en};
             ADDR_ADDR:   rdata_r = {1'b0, addr_reg};
@@ -197,9 +198,8 @@ module usb_regs (
             hpend     <= 0;
             hpend_byte <= 0;
             fw_valid  <= 0;
-            cmd_wr    <= 0;
+            cmd_pend  <= 0;
         end else begin
-            cmd_wr <= 0;
 
             sptr <= sptr_next;
             hptr <= hptr_next;
@@ -225,12 +225,20 @@ module usb_regs (
                     ADDR_IRQ_EN: irq_en <= wdata[3:0];
                     ADDR_ADDR:   addr_reg <= wdata[6:0];
                     ADDR_CMD: begin
-                        if (!busy) begin
+                        if (ctrl[0]) begin
+                            // host: queue the op until the SIE can start it
+                            if (!busy && !cmd_pend && wdata[5:4] != 2'b11) begin
+                                cmd_ep    <= wdata[3:0];
+                                cmd_op    <= wdata[5:4];
+                                cmd_data1 <= wdata[6];
+                                cmd_any   <= wdata[7];
+                                cmd_pend  <= 1;
+                            end
+                        end else if (!busy) begin
                             cmd_ep    <= wdata[3:0];
                             cmd_op    <= wdata[5:4];
                             cmd_data1 <= wdata[6];
                             cmd_any   <= wdata[7];
-                            cmd_wr    <= 1;
                         end
                     end
                     ADDR_LEN: begin
@@ -268,6 +276,10 @@ module usb_regs (
                 sie_res_val[6:4] == 3'b0 &&
                 sie_res_val[3:0] != 4'ha && sie_res_val[3:0] != 4'he)
                 sbuf <= ~sbuf;
+
+            // pending host op: the SIE started it, or host mode left
+            if (sie_cmd_ack || !ctrl[0])
+                cmd_pend <= 0;
         end
     end
 

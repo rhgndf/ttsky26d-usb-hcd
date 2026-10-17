@@ -125,8 +125,13 @@ async def test_register_interfaces(dut):
     await ClockCycles(dut.clk, 16)
 
     assert await spi_read(dut, 0, 1) == [0x5b]
+    # device mode at reset: D- pull-down pin released
+    assert ((int(dut.uio_oe.value) >> 6) & 1) == 0
     await spi_write(dut, 1, [0x21])
     assert await spi_read(dut, 1, 1) == [0x21]
+    # host mode: uio[6] drives the D- 15k pull-down low
+    assert ((int(dut.uio_oe.value) >> 6) & 1) == 1
+    assert ((int(dut.uio_out.value) >> 6) & 1) == 0
     await spi_write(dut, 5, [0x55])
     assert await spi_read(dut, 5, 1) == [0x55]
 
@@ -946,4 +951,179 @@ async def test_iso(dut):
     pkt = await usb_bus.recv_packet(dut)
     assert pkt is not None and pkt[0] == usb_bus.pid_byte(0xA), f"expected NAK {pkt}"
 
+    assert int(dut.contention_count.value) == 0
+
+
+@cocotb.test()
+async def test_cmd_pending(dut):
+    """CMD issued inside the SOF guard window is queued (BUSY=1) and runs
+    right after the next SOF; a CMD written while the PHY transmits is not
+    dropped either."""
+    await _tb_init(dut)
+    await spi_write(dut, 1, [0x05])  # HOST | SOF_EN
+    await spi_write(dut, 4, [0x0f])
+    await spi_write(dut, 3, [0x0f])
+    await spi_write(dut, 5, [0x00])
+
+    pkt = await usb_bus.recv_packet(dut)
+    assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x5), f"no SOF {pkt}"
+    dut._log.info("SOF1 seen")
+
+    async def responder():
+        pkt = await usb_bus.recv_packet(dut)   # next SOF
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x5), f"exp SOF {pkt}"
+        pkt = await usb_bus.recv_packet(dut)   # queued IN token
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x9), f"exp IN {pkt}"
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, usb_bus.data_bytes(0xB, [1, 2, 3, 4]))
+        pkt = await usb_bus.recv_packet(dut)   # ACK
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"no ACK {pkt}"
+    resp = cocotb.start_soon(responder())
+
+    # ~975 us after the SOF: inside the guard window (936..1000 us)
+    await wait_ns(975000)
+    dut._log.info("writing CMD in guard window")
+    await spi_write(dut, 6, [0x60])
+    # BUSY must read 1 immediately even though nothing is on the bus yet
+    assert (await spi_read(dut, 2, 1))[0] & 0x08, "CMD not pending"
+    await resp
+    assert await _wait_done(dut)
+    assert ((await spi_read(dut, 7, 1))[0] & 0x0f) == 0xB
+    dut._log.info("queued IN done")
+
+    # CMD while the PHY still has a packet in flight must not be dropped.
+    # responder3 is armed before the CMD write so it catches the IN token,
+    # which goes out only ~50 ns after the pend register is set.
+    resp3_ready = cocotb.triggers.Event()
+
+    async def responder3():
+        resp3_ready.set()
+        pkt = await usb_bus.recv_packet(dut)   # skips ACK2 tail / SOFs
+        while pkt is None or pkt[0] != usb_bus.pid_byte(0x9):
+            pkt = await usb_bus.recv_packet(dut)
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, usb_bus.data_bytes(0xB, [0x55]))
+        pkt = await usb_bus.recv_packet(dut)
+        while pkt is not None and pkt[0] == usb_bus.pid_byte(0x5):
+            pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"exp ACK3 {pkt}"
+
+    async def responder2():
+        pkt = await usb_bus.recv_packet(dut)   # IN token (immediate or post-SOF)
+        while pkt is not None and pkt[0] == usb_bus.pid_byte(0x5):
+            pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x9), f"exp IN {pkt}"
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, usb_bus.data_bytes(0xB, [0xaa]))
+        # write the next CMD while the PHY still sends the previous ACK
+        pkt_task = cocotb.start_soon(usb_bus.recv_packet(dut))
+        resp3 = cocotb.start_soon(responder3())
+        await resp3_ready.wait()
+        await spi_write(dut, 6, [0x60])
+        pkt = await pkt_task
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x2), f"no ACK2 {pkt}"
+        await resp3
+    resp = cocotb.start_soon(responder2())
+    await spi_write(dut, 6, [0x60])
+    await resp
+    dut._log.info("responder2 done")
+    assert await _wait_done(dut)
+    assert int(dut.contention_count.value) == 0
+
+
+@cocotb.test()
+async def test_sof_guard(dut):
+    """A 64-byte OUT issued just before the guard window keeps the next SOF on
+    its exact 48000-clock period."""
+    await _tb_init(dut)
+    await spi_write(dut, 1, [0x05])
+    await spi_write(dut, 4, [0x0f])
+    await spi_write(dut, 3, [0x0f])
+    await spi_write(dut, 5, [0x00])
+
+    data = [i & 0xFF for i in range(64)]
+    await spi_write(dut, 9, [0])
+    for b in data:
+        await spi_write(dut, 0x0A, [b])
+    await spi_write(dut, 9, [64])
+
+    pkt = await usb_bus.recv_packet(dut)
+    assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x5), f"no SOF1 {pkt}"
+    t1 = cocotb.utils.get_sim_time()
+
+    async def responder():
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x1), f"OUT {pkt}"
+        pkt = await usb_bus.recv_packet(dut)
+        assert pkt is not None and pkt[1:-2] == data
+        await ClockCycles(dut.clk, 10)
+        await usb_bus.send_packet(dut, [0x80, usb_bus.pid_byte(0x2)])
+    resp = cocotb.start_soon(responder())
+
+    # issue the OUT ~915 us after the SOF, just before the guard window
+    await wait_ns(915000)
+    await spi_write(dut, 6, [0x10])
+    await resp
+    assert await _wait_done(dut)
+
+    pkt = await usb_bus.recv_packet(dut)
+    assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x5), f"no SOF2 {pkt}"
+    t2 = cocotb.utils.get_sim_time()
+    gap_clks = (t2 - t1) / 20833.333
+    assert 47800 < gap_clks < 48200, f"SOF gap {gap_clks} clk"
+    assert int(dut.contention_count.value) == 0
+
+
+@cocotb.test()
+async def test_host_timeout_window(dut):
+    """Host IN timeout: a reply starting 15 bit times after EOP succeeds,
+    one starting 30 bit times after reports TIMEOUT."""
+    await _tb_init(dut)
+    await spi_write(dut, 1, [0x01])
+    await spi_write(dut, 4, [0x0f])
+    await spi_write(dut, 3, [0x0f])
+    await spi_write(dut, 5, [0x00])
+
+    async def in_with_delay(bit_times):
+        async def responder():
+            pkt = await usb_bus.recv_packet(dut)
+            assert pkt is not None and pkt[0] == usb_bus.pid_byte(0x9)
+            await Timer(bit_times * usb_bus.BIT_PS, unit="ps")
+            await usb_bus.send_packet(dut, usb_bus.data_bytes(0xB, [0xa5]))
+            pkt = await usb_bus.recv_packet(dut)  # possible ACK
+        resp = cocotb.start_soon(responder())
+        await spi_write(dut, 6, [0x60])
+        await resp
+        assert await _wait_done(dut)
+        return (await spi_read(dut, 7, 1))[0]
+
+    # 15 bit times: must succeed and ACK
+    result = await in_with_delay(15)
+    assert (result >> 4) & 7 == 0 and result & 0x0f == 0xB, f"15-bit reply {result:#x}"
+    assert (await spi_read(dut, 9, 1))[0] == 1
+    assert await spi_read(dut, 0x0A, 1) == [0xa5]
+
+    # 30 bit times: TIMEOUT (the late packet is ignored)
+    result = await in_with_delay(30)
+    assert (result >> 4) & 7 == 1, f"30-bit reply {result:#x}"
+
+    assert int(dut.contention_count.value) == 0
+
+
+@cocotb.test()
+async def test_device_setup_unarmed(dut):
+    """Device with nothing armed never handshakes a SETUP; IRQ.NAK is set."""
+    await _tb_init(dut)
+    await spi_write(dut, 1, [0x02])
+    await spi_write(dut, 4, [0x0f])
+    await spi_write(dut, 3, [0x0f])
+    await spi_write(dut, 5, [0x00])
+    # cmd_op = 0: nothing armed
+
+    await usb_bus.send_packet(dut, usb_bus.token_bytes(0xD, 0, 0))
+    await ClockCycles(dut.clk, 6)
+    await usb_bus.send_packet(dut, usb_bus.data_bytes(0x3, [0x80, 0x06, 0, 1, 0, 0, 8, 0]))
+    none = await usb_bus.recv_packet(dut, limit_cycles=60)
+    assert none is None, f"unarmed SETUP got handshake {none}"
+    assert (await spi_read(dut, 3, 1))[0] & 0x08, "no NAK irq"
     assert int(dut.contention_count.value) == 0

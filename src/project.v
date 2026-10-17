@@ -24,7 +24,7 @@ module tt_um_rhgndf_usb_hcd (
     wire [6:0] target_addr;
     wire [3:0] cmd_ep;
     wire [1:0] cmd_op;
-    wire cmd_data1, cmd_any, cmd_wr;
+    wire cmd_data1, cmd_any, cmd_pend, cmd_ack;
     wire [6:0] len_reg;
     wire       iso;
     wire [7:0] buf_rdata;
@@ -68,7 +68,8 @@ module tt_um_rhgndf_usb_hcd (
         .dm_sync(dm_sync), .se0_long(se0_long), .frame(frame),
         .ctrl(ctrl), .addr_reg(target_addr), .cmd_ep(cmd_ep),
         .cmd_op(cmd_op), .cmd_data1(cmd_data1), .cmd_any(cmd_any),
-        .cmd_wr(cmd_wr), .len_reg(len_reg), .iso(iso),
+        .cmd_pend(cmd_pend), .sie_cmd_ack(cmd_ack),
+        .len_reg(len_reg), .iso(iso),
         .buf_rdata(buf_rdata),
         .sie_buf_we(sie_buf_we), .sie_buf_wdata(sie_buf_wdata),
         .sie_buf_inc(sie_buf_inc), .sie_bufptr_clr(sie_bufptr_clr),
@@ -83,7 +84,8 @@ module tt_um_rhgndf_usb_hcd (
         .clk(clk), .rst_n(rst_n), .dp_in(uio_in[0]), .dm_in(uio_in[1]),
         .ctrl(ctrl), .addr_reg(target_addr), .cmd_ep(cmd_ep),
         .cmd_op(cmd_op), .cmd_data1(cmd_data1), .cmd_any(cmd_any),
-        .cmd_wr(cmd_wr), .len_reg(len_reg), .iso(iso),
+        .cmd_pend(cmd_pend), .cmd_ack(cmd_ack),
+        .len_reg(len_reg), .iso(iso),
         .buf_rdata(buf_rdata),
         .busy(sie_busy), .dp_sync(dp_sync), .dm_sync(dm_sync),
         .se0_long(se0_long), .frame(frame), .buf_we(sie_buf_we),
@@ -96,7 +98,7 @@ module tt_um_rhgndf_usb_hcd (
     );
 
     assign uio_out = {2'b00, spi_cipo, 1'b0, 1'b0, 1'b1, usb_tx_dm, usb_tx_dp};
-    assign uio_oe  = {2'b00, spi_active, i2c_sda_oe, ctrl[0],
+    assign uio_oe  = {1'b0, ctrl[0], spi_active, i2c_sda_oe, ctrl[0],
                       (!ctrl[0] && ctrl[1]), usb_tx_oe, usb_tx_oe};
 
     assign uo_out = {3'b000, usb_tx_active, dp_sync, dm_sync, ctrl[5], irq_pin};
